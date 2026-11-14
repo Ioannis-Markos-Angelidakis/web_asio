@@ -4,14 +4,14 @@ project(fw_web LANGUAGES CXX)
 # ---------------------------------------------------------------------------
 # fw — C++26 standalone-asio web framework (HTTP/1.1 + HTTP/2 + TLS + SSE)
 #   Modular layout:
-#     fw/  — reusable protocol library (headers + sessions.cpp)
+#     fw/  — reusable protocol library (headers + sessions.cpp + json_parse.cpp)
 #     app/ — the chat demo application that consumes the library
 #
 #   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build -j
 #
 # Options:
-#   -DFW_HTTP2=ON|OFF   HTTP/2 via nghttp2          (default ON, auto-off if missing)
+#   -DFW_HTTP2=ON|OFF   HTTP/2, built-in pure C++26      (default ON)
 #   -DFW_TLS=ON|OFF     TLS/ALPN via OpenSSL        (default ON, auto-off if missing)
 #   -DFW_SANITIZE=ON    ASan+UBSan build            (GCC/Clang only)
 #   -DFW_ASIO_ROOT=...  path to standalone asio's *include* dir
@@ -52,7 +52,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Debug | Release | RelWithDebInfo | MinSizeRel" FORCE)
 endif()
 
-option(FW_HTTP2 "HTTP/2 support (nghttp2)" ON)
+option(FW_HTTP2 "HTTP/2 support (built-in pure C++)" ON)
 option(FW_TLS "TLS + ALPN support (OpenSSL)" ON)
 option(FW_SANITIZE "Address/Undefined sanitizer build" OFF)
 
@@ -90,6 +90,22 @@ if(NOT EXISTS "${ASIO_INCLUDE_DIR}/asio/cancel_after.hpp" AND
     "pass -DFW_ASIO_ROOT=/path/to/asio/include")
 endif()
 
+# ---- simdjson (bundled single-header, Apache-2.0/MIT) ----------------------
+# fw's JSON parsing (fw/json_parse.cpp) is delegated to simdjson, bundled in
+# third_party/simdjson. Only that one TU includes simdjson.h; the serializer
+# in fw/json.hpp stays built-in. The singleheader/ files are an official
+# simdjson release artifact — never patched, so upgrading = drop in new files.
+set(SIMDJSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson/singleheader")
+if(NOT EXISTS "${SIMDJSON_DIR}/simdjson.h")
+  message(FATAL_ERROR "bundled simdjson not found: ${SIMDJSON_DIR}/simdjson.h")
+endif()
+add_library(simdjson STATIC "${SIMDJSON_DIR}/simdjson.cpp")
+target_include_directories(simdjson PUBLIC "${SIMDJSON_DIR}")
+if(MSVC)
+  # the amalgamated TU is huge; debug section counts overflow C1128 without /bigobj
+  target_compile_options(simdjson PRIVATE /bigobj)
+endif()
+
 # ---- OpenSSL ---------------------------------------------------------------
 # (HTTP/2 is built in — pure C++26, no nghttp2. TLS/ALPN is the only
 #  external protocol library, via asio::ssl over OpenSSL.)
@@ -105,9 +121,9 @@ endif()
 # Header-only modules + one TU that explicitly instantiates the session
 # templates for the stream types the Listener creates. FW_HTTP2 / FW_TLS are
 # PUBLIC because the headers themselves are guarded by them.
-add_library(fw STATIC fw/sessions.cpp)
+add_library(fw STATIC fw/sessions.cpp fw/json_parse.cpp)
 target_include_directories(fw PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(fw PUBLIC fw_asio Threads::Threads)
+target_link_libraries(fw PUBLIC fw_asio simdjson Threads::Threads)
 if(WIN32)
   # standalone asio needs Winsock (+ mswsock for AcceptEx/ConnectEx);
   # neither MSVC nor MinGW auto-link them.
@@ -135,7 +151,7 @@ add_executable(webfw
 target_link_libraries(webfw PRIVATE fw)
 
 if(FW_SANITIZE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
-  foreach(tgt fw webfw)
+  foreach(tgt fw simdjson webfw)
     target_compile_options(${tgt} PRIVATE
       -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g)
     target_link_options(${tgt} PRIVATE -fsanitize=address,undefined)

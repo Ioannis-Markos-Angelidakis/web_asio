@@ -4,9 +4,11 @@ A C++26 / standalone-Asio web framework (HTTP/1.1 + HTTP/2 + TLS/ALPN + SSE +
 the chat demo) — **HTTP/2 implemented from scratch in pure C++26**
 (framing, HPACK with Huffman, flow control, multiplexing, GOAWAY — no
 nghttp2), split into a proper library/application tree for separation of
-concerns. The only protocol dependency is OpenSSL, and only for TLS
-(build with `FW_TLS=0` and even that disappears — h2c + HTTP/1.1 are pure).
-This tree is the one to develop in.
+concerns. Two libraries are vendored so nothing has to be installed:
+standalone Asio 1.34.2 (I/O) and simdjson 5.1.1 (the heavily-optimized
+SIMD JSON parser behind `fw::json::parse`). The only system dependency is
+OpenSSL, and only for TLS (build with `FW_TLS=0` and even that disappears
+— h2c + HTTP/1.1 are pure). This tree is the one to develop in.
 
 ## Layout
 
@@ -16,7 +18,8 @@ fw/                     the reusable protocol library (namespace fw)
 ├── detail/base.hpp     common includes + build flags (ASIO_STANDALONE, …)
 ├── util.hpp            clocks/timeouts, logging, string & number helpers,
 │                       percent-decoding, random tokens, server_id()
-├── json.hpp            strict JSON parser + serializer
+├── json.hpp            JSON Value model + serializer (parse is delegated
+│                       to the bundled simdjson — see json_parse.cpp)
 ├── multipart.hpp       strict RFC 2046 multipart/form-data parser
 ├── message.hpp         Request / Response, status text, MIME, SSE framing,
 │                       target parsing (shared by h1 and h2)
@@ -48,8 +51,10 @@ fw/                     the reusable protocol library (namespace fw)
 ├── http2_session.hpp   fw::h2 — asio adapter around h2_conn: strand, pump
 │                       (single writer), per-stream sendq watermarks, SSE
 ├── listener.hpp        one port, three protocols: sniff → TLS/h2c/h1
-└── sessions.cpp        the only library TU: explicit instantiation of the
-                        session templates for the two stream types the
+├── json_parse.cpp      library TU: simdjson-backed fw::json::parse() — the
+│                       only file that includes the big amalgamated header
+└── sessions.cpp        library TU: explicit instantiation of the session
+                        templates for the two stream types the
                         Listener creates (plain TCP, TLS-over-PrefacedStream)
 
 app/                    the chat demo application (namespace fw::chat)
@@ -70,10 +75,15 @@ examples/
 
 public/                 chat UI (sse.html)
 third_party/
-└── asio/               bundled standalone Asio 1.34.2 headers (used
-                        automatically; Boost Software License — see
-                        third_party/asio.COPYING). Override with ASIO_ROOT
-                        / FW_ASIO_ROOT to use any Asio >= 1.31 instead.
+├── asio/               bundled standalone Asio 1.34.2 headers (used
+│                       automatically; Boost Software License — see
+│                       third_party/asio.COPYING). Override with ASIO_ROOT
+│                       / FW_ASIO_ROOT to use any Asio >= 1.31 instead.
+└── simdjson/           bundled simdjson 5.1.1 official single-header build
+                        (unmodified upstream artifact; Apache-2.0/MIT
+                        dual-licensed — see third_party/simdjson/LICENSE).
+                        SIMD JSON parsing with runtime CPU dispatch; used
+                        by fw/json_parse.cpp. No vcpkg/apt install needed.
 dev_cert.sh             self-signed cert generator (SANs for LAN IPs)
 CMakeLists.txt          cmake build (library + app + selftest target)
 Makefile                plain make build for cmake-less days
@@ -85,11 +95,13 @@ nothing in `fw/` ever includes `app/`.
 ## Build
 
 Requirements: g++ ≥ 14 (or clang ≥ 18), libssl-dev — **only for TLS**.
-HTTP/2 is built in (pure C++26), so a bare `make` with no OpenSSL still
-yields a full HTTP/1.1 + h2c server. Standalone Asio ≥ 1.31
-(`asio/cancel_after.hpp`) is **bundled** in `third_party/asio` — both build
-systems pick it up automatically. To use a different/newer Asio, pass
-`ASIO_ROOT=...` (Make) or `-DFW_ASIO_ROOT=...` (CMake).
+HTTP/2 is built in (pure C++26) and JSON parsing uses the **bundled**
+simdjson, so a bare `make` with no OpenSSL still yields a full
+HTTP/1.1 + h2c server. Standalone Asio ≥ 1.31 (`asio/cancel_after.hpp`)
+is **bundled** in `third_party/asio`, simdjson 5.1.1 in
+`third_party/simdjson` — both build systems pick both up automatically.
+To use a different/newer Asio, pass `ASIO_ROOT=...` (Make) or
+`-DFW_ASIO_ROOT=...` (CMake).
 
 ```sh
 # with make (uses bundled asio)
@@ -106,8 +118,10 @@ make webfw_san && ./webfw_san --selftest
 
 # raw g++ (what the Makefile does)
 g++ -std=c++26 -O2 -Wall -Wextra -Wpedantic -pthread \
-    -DFW_HTTP2=1 -DFW_TLS=1 -Ithird_party/asio -I. \
-    fw/sessions.cpp app/main.cpp app/chat_routes.cpp app/selftest.cpp \
+    -DFW_HTTP2=1 -DFW_TLS=1 -Ithird_party/asio -Ithird_party/simdjson/singleheader -I. \
+    fw/sessions.cpp fw/json_parse.cpp \
+    third_party/simdjson/singleheader/simdjson.cpp \
+    app/main.cpp app/chat_routes.cpp app/selftest.cpp \
     app/selftest_h2.cpp -o webfw -lssl -lcrypto
 ```
 
@@ -176,14 +190,15 @@ ship in VS 2022 ≥ 17.8) plus `/utf-8`, `/Zc:__cplusplus`,
 
 ### Make variables (no-CMake route)
 
-| variable   | default                                          | meaning                                |
-|------------|--------------------------------------------------|----------------------------------------|
-| `ASIO_ROOT`| bundled `third_party/asio`                       | path to any Asio ≥ 1.31 include dir    |
-| `FW_HTTP2` | 1                                                | 0 → build without HTTP/2               |
-| `FW_TLS`   | 1                                                | 0 → build without TLS                  |
-| `CXX`      | g++                                              | e.g. `CXX=clang++`                     |
-| `CXXFLAGS` | `-std=c++26 -O2 -Wall -Wextra -Wpedantic -pthread` | override for a debug build: `CXXFLAGS="-std=c++26 -O0 -g -Wall -Wextra -pthread"` |
-| targets    | `webfw`, `webfw_san`, `selftest`, `clean`        | `selftest` = build + run unit tests    |
+| variable        | default                                      | meaning                                |
+|-----------------|----------------------------------------------|----------------------------------------|
+| `ASIO_ROOT`     | bundled `third_party/asio`                   | path to any Asio ≥ 1.31 include dir    |
+| `SIMDJSON_ROOT` | bundled `third_party/simdjson/singleheader`  | another simdjson single-header dir     |
+| `FW_HTTP2`      | 1                                            | 0 → build without HTTP/2               |
+| `FW_TLS`        | 1                                            | 0 → build without TLS                  |
+| `CXX`           | g++                                          | e.g. `CXX=clang++`                     |
+| `CXXFLAGS`      | `-std=c++26 -O2 -Wall -Wextra -Wpedantic -pthread` | override for a debug build: `CXXFLAGS="-std=c++26 -O0 -g -Wall -Wextra -pthread"` |
+| targets         | `webfw`, `webfw_san`, `selftest`, `clean`    | `selftest` = build + run unit tests    |
 
 ### Compile-time limits (`fw/limits.hpp`)
 
@@ -195,6 +210,7 @@ only the two most common as CLI flags (see above).
 |-----------------------|-----------|--------------------------------------------|
 | header section        | 32 KiB    | 431 (both protocols)                       |
 | header count          | 100       | 431                                        |
+| JSON nesting depth   | 1024      | 400 (simdjson DEFAULT_MAX_DEPTH)           |
 | request body          | 1 MiB     | 413 (h1) / RST (h2) — `--max-body`         |
 | concurrent h2 streams | 100       | excess streams answered RST REFUSED_STREAM  |
 | h2 send buffer        | 256 KiB high-water per stream | drain pauses, resumes on ACK |
@@ -333,40 +349,73 @@ hand it to a `Listener` with a `ShutdownRegistry`, run `io_context` on N
 threads. Adding a chat route touches only `app/chat_routes.cpp`; framework
 changes live in `fw/`. The chat demo is a consumer, not a component.
 
+```sh
+# build the example app against the library (TLS optional — drop
+# -DFW_TLS=1/-lssl/-lcrypto for an h1+h2c-only binary)
+g++ -std=c++26 -O2 -Wall -Wextra -Wpedantic -pthread \
+    -DFW_HTTP2=1 -DFW_TLS=1 \
+    -Ithird_party/asio -Ithird_party/simdjson/singleheader -I. \
+    examples/hello.cpp fw/sessions.cpp fw/json_parse.cpp \
+    third_party/simdjson/singleheader/simdjson.cpp \
+    -o hello -lssl -lcrypto
+./hello --port 8090 --docroot public
+```
+
 ## Build-time tradeoff (measured, 2-core sandbox)
 
 | change                          | single-file | modular (make -j2) |
 |---------------------------------|------------:|-------------------:|
-| full clean build                |      26 s   |        52 s         |
-| edit a chat route (app/)        |      26 s   |        14 s        |
-| edit a framework header (fw/)   |      26 s   |        51 s        |
+| full clean build                |      17 s   |        73 s         |
+| edit a chat route (app/)        |      17 s   |        15 s         |
+| edit a framework header (fw/)   |      17 s   |        60 s         |
 
+The modular clean build now includes the vendored simdjson TU (~40 s of
+the 73 s; it is **not** rebuilt when you edit fw/ or app/ files). The
+single-file edition keeps the old hand-rolled JSON parser, so it compiles
+faster but parses slower — that is the trade you are making.
 Header-only libraries pay re-parsing per TU; the single file gets a free
-"unity build". In exchange you get an app-only iteration loop twice as fast,
-per-module testability, dependency-ordered navigation and no monolithic
-merge surface. If clean-build time matters most, build the single-file
-edition; if the app loop matters, build this one.
+"unity build". In exchange you get an app-only iteration loop at least as
+fast, per-module testability, dependency-ordered navigation and no
+monolithic merge surface. If clean-build time matters most, build the
+single-file edition; if the app loop matters, build this one.
 
 ## Verified state
 
 * `--selftest`: **89/89** — 61 general (json, multipart, router, parsing,
   hygiene) + 28 HTTP/2 (RFC 7541 Appendix C conformance incl. Huffman and
   dynamic-table eviction, framing, engine scenarios: PING echo, flow-window
-  accounting, REFUSED_STREAM, COMPRESSION_ERROR → GOAWAY)
+  accounting, REFUSED_STREAM, COMPRESSION_ERROR → GOAWAY). The JSON tests
+  (escapes, surrogate pairs, trailing garbage, lone surrogates, single
+  quotes) all run through the bundled simdjson backend now.
+* JSON: parsing is delegated to bundled simdjson 5.1.1 (official upstream
+  single-header artifact, unmodified). `fw::json::parse` semantics are
+  unchanged — insertion-ordered objects, duplicate keys preserved (find()
+  returns the first), all numbers stored as double, strict UTF-8 — and the
+  full matrix below was re-run against the simdjson-backed build.
 * E2E against **curl's independent nghttp2 client**: h2c GET/POST, 20 KiB
   header forcing CONTINUATION, 4-way multiplexing, SSE-over-h2c with live
   events, client-cancel RST mid-stream, 3 MiB upload *and* download through
   real flow-control windows, `expect: 100-continue` (interim `:status 100`
   verified on the wire), TLS/ALPN h2, 105-stream floods (exactly 5 refused),
   malformed HPACK → GOAWAY(9)
-* ASan+UBSan (`make webfw_san`): the entire matrix above runs with zero
-  sanitizer reports (it caught three real lifetime bugs during development:
-  a Huffman-tree reallocation UAF, a dangling `H2EngineLimits&` temporary,
-  and a send-buffer reallocation during in-flight writes — all fixed)
+* full SSE chat-flow suite (raw-socket clients): welcome/token handshake,
+  409 duplicates, 400-vs-401 auth split (malformed body vs unknown token),
+  token-owner attribution (impersonation rejected), private chat lifecycle
+  (request → accept → unique `private_<id>` stream → messages → ended),
+  history replay, stale-token rejection, SVG upload blocked from inline
+  view, path-traversal attempts never leak files
+* ASan+UBSan (`make -j webfw_san`, now parallel per-TU objects incl. the
+  simdjson TU): the entire matrix above runs with zero sanitizer reports
+  (it caught three real lifetime bugs during development: a Huffman-tree
+  reallocation UAF, a dangling `H2EngineLimits&` temporary, and a
+  send-buffer reallocation during in-flight writes — all fixed)
 * every `fw/*.hpp` compiles standalone (include hygiene)
-* `examples/hello.cpp` builds and serves h1, h2c and SSE-over-h2c
+* `examples/hello.cpp` builds (see the one-liner above) and serves h1, h2c
+  and SSE-over-h2c
 * both CMake configurations (Release and Debug) configured, built and run
 * Windows routes: previously user-verified with nghttp2; the pure-C++ engine
-  removes the nghttp2 dependency entirely, so Routes 2–4 now need OpenSSL
-  only for TLS (compile-ready by audit — same guarded-POSIX code, MSVC
-  `/std:c++latest` mapping, ws2_32/mswsock linking)
+  removes the nghttp2 dependency entirely, and simdjson is bundled (also
+  officially supports MSVC 2019+ and MinGW; CMake adds `/bigobj` for MSVC's
+  amalgamated TU), so Routes 2–4 now need OpenSSL only for TLS
+  (compile-ready by audit — same guarded-POSIX code, MSVC `/std:c++latest`
+  mapping, ws2_32/mswsock linking)
