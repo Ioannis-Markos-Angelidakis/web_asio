@@ -40,15 +40,16 @@ class Router {
   // some route but with a different method, *method_mismatch is set.
   // HEAD is answered by GET handlers (the response serializers strip the
   // body for HEAD, so this is safe and matches common framework behavior).
+  // `params` is flat Fields storage (see fw/message.hpp) — filled by moving
+  // a small local vector in on success; failed matches do not clobber it.
   const Route* match(std::string_view method, std::string_view path,
-                     std::map<std::string, std::string, std::less<>>& params,
-                     bool& method_mismatch) const {
+                     Fields& params, bool& method_mismatch) const {
     method_mismatch = false;
     const std::string m = (method == "HEAD") ? std::string("GET")
                                              : std::string(method);
     const auto segs = split_path(path);
     for (const auto& r : routes_) {
-      std::map<std::string, std::string, std::less<>> mm;
+      Fields mm;
       if (match_segments(r.segments, segs, mm)) {
         if (r.method != m) { method_mismatch = true; continue; }
         params = std::move(mm);
@@ -118,7 +119,7 @@ class Router {
 
   static bool match_segments(const std::vector<std::string>& pat,
                              const std::vector<std::string_view>& segs,
-                             std::map<std::string, std::string, std::less<>>& out) {
+                             Fields& out) {
     std::size_t i = 0;
     for (; i < pat.size(); ++i) {
       const std::string& ps = pat[i];
@@ -128,7 +129,7 @@ class Router {
           if (k > i) rest += '/';
           rest += std::string(segs[k]);
         }
-        out.emplace("rest", std::move(rest));
+        field_set(out, "rest", std::move(rest));
         return true;
       }
       if (i >= segs.size()) return false;
@@ -140,9 +141,10 @@ class Router {
           const bool ok = check_typed(type, val);
           if (!ok) return false;
         }
-        out.emplace(ps.substr(1, lt == std::string::npos ? std::string::npos
-                                                         : lt - 1),
-                    std::string(val));
+        field_set(out,
+                  ps.substr(1, lt == std::string::npos ? std::string::npos
+                                                       : lt - 1),
+                  std::string(val));
       } else {
         if (ps != segs[i]) return false;
       }

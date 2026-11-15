@@ -160,6 +160,7 @@ class Listener {
         "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     Sniff r;
     std::string& acc = r.bytes;
+    acc.reserve(128);  // preface is 24 B; one read usually settles it
     for (;;) {
       if (!acc.empty()) {
         if (static_cast<unsigned char>(acc[0]) == 0x16) {

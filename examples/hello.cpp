@@ -7,9 +7,11 @@
 //
 // Build (after `make` has built the objects):
 //   g++ -std=c++26 -O2 -pthread -DFW_HTTP2=1 -DFW_TLS=1
-//       -I"$ASIO_ROOT" -I.. -c examples/hello.cpp -o /tmp/hello.o
-//   g++ -o /tmp/hello /tmp/hello.o fw/sessions.o
-//       -pthread -lnghttp2 -lssl -lcrypto
+//       -Ithird_party/asio -Ithird_party/simdjson/singleheader -I.
+//       -c examples/hello.cpp -o /tmp/hello.o
+//   g++ -o /tmp/hello /tmp/hello.o fw/sessions.o fw/json_parse.o
+//       third_party/simdjson/singleheader/simdjson.o
+//       -pthread -lssl -lcrypto
 //   /tmp/hello --port 18099 --docroot public
 // ===========================================================================
 #include "fw/fw.hpp"
@@ -33,7 +35,8 @@ int main(int argc, char** argv) {
   App app;
   app.Get("/",    [](HttpCtx& c) -> asio::awaitable<void> { co_await page(c, "hello"); });
   app.Get("/hi/:name", [](HttpCtx& c) -> asio::awaitable<void> {
-    co_await page(c, "hi " + c.req.params.at("name"));
+    const std::string* name = c.req.raw_param("name");
+    co_await page(c, "hi " + (name ? *name : std::string("?")));
   });
 
   // SSE: a ticking clock, driven through the same OutStream machinery.

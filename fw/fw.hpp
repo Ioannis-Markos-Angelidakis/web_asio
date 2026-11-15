@@ -6,6 +6,7 @@
 
 #include "fw/detail/base.hpp"
 #include "fw/util.hpp"
+#include "fw/arena.hpp"
 #include "fw/json.hpp"
 #include "fw/multipart.hpp"
 #include "fw/message.hpp"

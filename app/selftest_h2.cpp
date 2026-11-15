@@ -9,8 +9,10 @@
 #include "fw/h2_conn.hpp"
 #include "fw/h2_frame.hpp"
 #include "fw/h2_hpack.hpp"
+#include "fw/detail/mem_probe.hpp"
 
 #include <cstring>
+#include <cstdio>
 
 namespace fw::h2 {
 namespace {
@@ -28,8 +30,15 @@ using hpack::Encoder;
     };
     raw.push_back(char((nib(hex[i]) << 4) | nib(hex[i + 1])));
   }
+  // decode() hands back views into the arena — copy to owning strings so
+  // the helper can return them safely (the arena dies with this frame).
+  Arena scratch;
+  std::vector<Decoder::Field> fields;
+  (void)d.decode(raw, 100, 64 * 1024, fields, scratch);
   std::vector<std::pair<std::string, std::string>> out;
-  d.decode(raw, 100, 64 * 1024, out);
+  out.reserve(fields.size());
+  for (const auto& [n, v] : fields)
+    out.emplace_back(std::string(n), std::string(v));
   return out;
 }
 
@@ -100,6 +109,23 @@ struct Ev : H2ConnEvents {
     i += 9 + len;
   }
   return false;
+}
+
+// Sum the payload bytes of every COMPLETE frame of `type` in a raw byte
+// stream (trailing partial frames are ignored — expected when the stream
+// was assembled from arbitrary consume() slices).
+[[nodiscard]] std::size_t sum_payload(std::string_view raw,
+                                     std::uint8_t type) {
+  std::size_t total = 0, i = 0;
+  while (i + 9 <= raw.size()) {
+    const auto len = (std::uint32_t(std::uint8_t(raw[i])) << 16) |
+                     (std::uint32_t(std::uint8_t(raw[i + 1])) << 8) |
+                     std::uint32_t(std::uint8_t(raw[i + 2]));
+    if (i + 9 + len > raw.size()) break;  // torn tail — not counted
+    if (std::uint8_t(raw[i + 3]) == type) total += len;
+    i += 9 + len;
+  }
+  return total;
 }
 
 std::string hpack_plain(std::initializer_list<std::pair<std::string_view,
@@ -222,11 +248,21 @@ bool run_h2_selftests(int& pass, int& fail) {
     enc.encode("content-type", "text/event-stream; charset=utf-8", buf);
     enc.encode("x-custom", "quotes \" and \x7f", buf);
     Decoder dec;
-    std::vector<std::pair<std::string, std::string>> out;
-    check(dec.decode(buf, 100, 64 * 1024, out).empty() && out.size() == 3 &&
-              out[0].first == ":status" && out[0].second == "200" &&
+    Arena scratch;
+    std::vector<Decoder::Field> out;
+    check(dec.decode(buf, 100, 64 * 1024, out, scratch).empty() &&
+              out.size() == 3 && out[0].first == ":status" &&
+              out[0].second == "200" &&
               out[2].second == "quotes \" and \x7f",
           "encoder → decoder round-trip");
+    // decode() views point into the arena; a second block decoded into the
+    // same arena must not disturb them while the block is being processed.
+    std::string buf2;
+    enc.encode("x-next", "round", buf2);
+    std::vector<Decoder::Field> out2;
+    check(dec.decode(buf2, 100, 64 * 1024, out2, scratch).empty() &&
+              out2.size() == 1 && out[0].second == "200",
+          "decoder views stable across blocks");
   }
 
   // ---- framing ----------------------------------------------------------------
@@ -349,6 +385,133 @@ bool run_h2_selftests(int& pass, int& fail) {
     std::uint32_t code = 0;
     check(find_goaway(c4.output(), code) && code == frame::kCompressionError,
           "GOAWAY COMPRESSION_ERROR emitted");
+  }
+
+  // ---- memory: warm-connection request/response cycle allocates O(1) --------
+  // (allocation-count regression: arena-backed HPACK decode + retained
+  // scratch buffers vs. the previous per-string copies — see README
+  // §Memory management. Threshold is generous for cross-stdlib variance.)
+  {
+    H2EngineLimits lim;
+    Ev ev;
+    H2Conn conn(lim, ev);
+    conn.start();
+    conn.feed(cli().data(), cli().size());
+
+    // one request on stream 1 to warm every scratch buffer
+    std::string heads;
+    frame::append(heads, frame::kHeaders, frame::kEndHeaders | frame::kEndStream, 1,
+                  hpack_plain({{":method", "GET"},
+                               {":path", "/warmup"},
+                               {":scheme", "http"},
+                               {":authority", "l"},
+                               {"accept", "*/*"},
+                               {"user-agent", "t"},
+                               {"accept-encoding", "g"},
+                               {"cookie", "s=1"}}));
+    conn.feed(heads.data(), heads.size());
+    conn.submit_response(1, {{":status", "200"},
+                             {"content-type", "text/plain"}},
+                         false);
+    conn.submit_data(1, "warm payload", true);
+    conn.produce();
+    check(ev.ends == 1 && ev.begins == 1, "warmup cycle ran");
+
+    // measured: an identical cycle on stream 3 of the SAME connection
+    std::string heads2;
+    frame::append(heads2, frame::kHeaders, frame::kEndHeaders | frame::kEndStream, 3,
+                  hpack_plain({{":method", "GET"},
+                               {":path", "/warmup"},
+                               {":scheme", "http"},
+                               {":authority", "l"},
+                               {"accept", "*/*"},
+                               {"user-agent", "t"},
+                               {"accept-encoding", "g"},
+                               {"cookie", "s=1"}}));
+    const std::vector<std::pair<std::string_view, std::string_view>> resp_h = {
+        {":status", "200"}, {"content-type", "text/plain"}};
+    std::string payload2 = "warm payload";  // same length → same capacities
+    std::int64_t n = -1;
+    {
+      fw::detail::MemProbe pr;
+      check(conn.feed(heads2.data(), heads2.size()), "warm cycle HEADERS fed");
+      conn.submit_response(3, resp_h, false);
+      conn.submit_data(3, std::move(payload2), true);
+      conn.produce();
+      n = pr.allocs();
+    }
+    check(ev.ends == 2 && ev.begins == 2, "warm cycle events fired");
+    check(n >= 0 && n <= 8, "warm h2 request/response cycle allocations <= 8");
+    std::fprintf(stderr, "  (probe: warm h2 cycle = %lld allocs)\n",
+                 static_cast<long long>(n));
+  }
+
+  // ---- memory: consume() cursor — fragmented drain of a large response ------
+  // Exercises the output cursor (out_pos_) and the per-stream sendq front
+  // offset (sq_pos): a 200 KiB body against a 64 KiB window, consumed in
+  // odd-sized slices that routinely split frames mid-payload, with window
+  // unlocks in between. The reassembled byte stream must contain exactly
+  // the submitted DATA bytes in intact frames and one final END_STREAM.
+  {
+    H2EngineLimits lim;
+    Ev ev;
+    H2Conn c(lim, ev);
+    c.start();
+    c.feed(cli().data(), cli().size());
+    std::string hf;
+    frame::append(hf, frame::kHeaders, frame::kEndHeaders | frame::kEndStream, 1,
+                  hpack_plain({{":method", "GET"}, {":path", "/"},
+                               {":scheme", "http"}, {":authority", "l"}}));
+    c.feed(hf.data(), hf.size());
+    const std::string big(200 * 1024, 'z');  // > default 65535 window
+    c.submit_response(1, {{":status", "200"}}, false);
+    c.submit_data(1, big, true);
+
+    std::string assembled;
+    std::size_t data_total = 0;
+    bool saw_end = false;
+    for (int round = 0; round < 400 && !(data_total == big.size() && saw_end);
+         ++round) {
+      c.produce();
+      const std::string_view out = c.output();
+      if (!out.empty()) {
+        const std::size_t take =
+            std::min<std::size_t>(out.size(), 700 + std::size_t(round) * 131);
+        assembled.append(out.substr(0, take));  // may split frames mid-way
+        c.consume(take);
+      }
+      data_total = sum_payload(assembled, frame::kData);
+      saw_end = count_frames(assembled, frame::kData, frame::kEndStream) >= 1;
+      // unlock 64 KiB of window on both connection and stream
+      std::string wu;
+      frame::append(wu, frame::kWindowUpdate, 0, 0,
+                    std::string("\x00\x01\x00\x00", 4));
+      c.feed(wu.data(), wu.size());
+      frame::append(wu, frame::kWindowUpdate, 0, 1,
+                    std::string("\x00\x01\x00\x00", 4));
+      c.feed(wu.data(), wu.size());
+    }
+    check(data_total == big.size(),
+          "consume() cursor: fragmented drain reassembles all DATA");
+    check(saw_end, "consume() cursor: END_STREAM delivered");
+    check(count_frames(assembled, frame::kData, frame::kEndStream) == 1,
+          "consume() cursor: exactly one END_STREAM DATA frame");
+    // the assembled stream must walk as intact frames end-to-end (no torn
+    // or duplicated bytes): the walk must land exactly on the end
+    {
+      std::size_t i = 0, frames = 0;
+      bool walk_ok = true;
+      while (i + 9 <= assembled.size()) {
+        const auto len = (std::uint32_t(std::uint8_t(assembled[i])) << 16) |
+                         (std::uint32_t(std::uint8_t(assembled[i + 1])) << 8) |
+                         std::uint32_t(std::uint8_t(assembled[i + 2]));
+        if (i + 9 + len > assembled.size()) { walk_ok = false; break; }
+        i += 9 + len;
+        ++frames;
+      }
+      check(walk_ok && i == assembled.size() && frames > 10,
+            "consume() cursor: byte stream is intact frames end-to-end");
+    }
   }
 
   return fail == 0;

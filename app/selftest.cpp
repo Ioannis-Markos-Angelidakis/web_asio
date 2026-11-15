@@ -4,7 +4,98 @@
 // ============================================================================
 
 #include "fw/fw.hpp"
+#include "fw/detail/mem_probe.hpp"
 #include "app/chat_hub.hpp"
+
+#include <cstdlib>
+#if defined(_WIN32)
+#include <malloc.h>  // _aligned_malloc / _aligned_free
+#endif
+
+// ============================================================================
+// Global allocation probe (fw/detail/mem_probe.hpp): counting new/delete
+// for the whole webfw binary. Inert unless a MemProbe is active — then each
+// allocation costs one relaxed atomic increment. Frees are not counted (the
+// regressions below measure allocation counts, not leak checks — leaks are
+// the sanitizer builds' job).
+// ============================================================================
+namespace {
+
+void probe_count(std::size_t n) {
+  if (fw::detail::g_mem_probe_active.load(std::memory_order_relaxed)) {
+    fw::detail::g_mem_probe_allocs.fetch_add(1, std::memory_order_relaxed);
+    fw::detail::g_mem_probe_bytes.fetch_add(std::int64_t(n),
+                                            std::memory_order_relaxed);
+  }
+}
+
+void* probe_malloc(std::size_t n) {
+  void* p = std::malloc(n ? n : 1);
+  if (!p) throw std::bad_alloc();
+  probe_count(n);
+  return p;
+}
+
+}  // namespace
+
+void* operator new(std::size_t n) { return probe_malloc(n); }
+void* operator new[](std::size_t n) { return probe_malloc(n); }
+
+// nothrow flavors (simdjson uses new[](nothrow) for its padded buffers):
+// without these, allocation would come from the default operator new while
+// the matching user-defined delete[] frees with free() → mismatch.
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+  void* p = std::malloc(n ? n : 1);
+  if (p) probe_count(n);
+  return p;
+}
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
+  void* p = std::malloc(n ? n : 1);
+  if (p) probe_count(n);
+  return p;
+}
+
+void* operator new(std::size_t n, std::align_val_t a) {
+  void* p = nullptr;
+#if defined(_WIN32)
+  p = ::_aligned_malloc(n ? n : 1, static_cast<std::size_t>(a));
+#else
+  // C11: round the size up to a multiple of the alignment
+  const std::size_t al = static_cast<std::size_t>(a);
+  const std::size_t sz = (n + al - 1) & ~(al - 1);
+  p = std::aligned_alloc(al, sz ? sz : al);
+#endif
+  if (!p) throw std::bad_alloc();
+  probe_count(n);
+  return p;
+}
+
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept {
+#if defined(_WIN32)
+  ::_aligned_free(p);
+#else
+  std::free(p);
+#endif
+}
+void operator delete(void* p, std::size_t, std::align_val_t a) noexcept {
+  operator delete(p, a);
+}
+void operator delete[](void* p, std::align_val_t) noexcept {
+  operator delete(p, std::align_val_t{});
+}
+void operator delete[](void* p, std::size_t, std::align_val_t a) noexcept {
+  operator delete(p, a);
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept {
+  std::free(p);
+}
+void operator delete[](void* p, const std::nothrow_t&) noexcept {
+  std::free(p);
+}
 
 namespace fw {
 // ---------------------------------------------------------------------------
@@ -89,8 +180,15 @@ bool run_selftest() {
     r.target = "/a%20b?x=1&y=a%20b&z=a+b";
     check(!init_request_target(r).has_value(), "target ok");
     check(r.path == "/a b", "target path decoded");
-    check(r.query["x"] == "1" && r.query["y"] == "a b" && r.query["z"] == "a b",
+    check(r.query_param("x") && *r.query_param("x") == "1" &&
+              r.query_param("y") && *r.query_param("y") == "a b" &&
+              r.query_param("z") && *r.query_param("z") == "a b",
           "query decoded");
+    // flat storage: duplicate keys keep first position, last value (map
+    // semantics preserved by field_set)
+    r.set_query("x", "2");
+    check(r.query.size() == 3 && *r.query_param("x") == "2",
+          "fields set_* duplicate semantics");
     Request r2;
     r2.target = "http://example.com/p?q=1";
     check(!init_request_target(r2).has_value() && r2.path == "/p", "absolute-form");
@@ -100,6 +198,72 @@ bool run_selftest() {
     Request r4;
     r4.target = "/x%0";
     check(init_request_target(r4).has_value(), "bad escape rejected");
+  }
+
+  // cached Date header (per-second, zero alloc steady state)
+  {
+    const std::string_view d1 = http_date_now();
+    const std::string_view d2 = http_date_now();
+    check(d1.size() == 29 && d1.substr(25) == " GMT" &&
+              (d1 == d2 || d1.substr(0, 18) == d2.substr(0, 18)),
+          "http_date_now cached format");
+  }
+
+  // ---- arena (fw/arena.hpp) --------------------------------------------------
+  {
+    Arena a;
+    const auto v1 = a.store("hello");
+    const auto v2 = a.store("world");
+    check(v1 == "hello" && v2 == "world", "arena store/views");
+    check((reinterpret_cast<std::uintptr_t>(a.allocate(7)) & 0xf) == 0,
+          "arena max_align alignment");
+    const std::string big(9000, 'x');
+    const auto v3 = a.store(big);
+    check(v3 == big && a.chunk_count() >= 2, "arena grows past first chunk");
+    check(v1 == "hello" && v2 == "world",
+          "arena views stable across growth");
+    check(a.bytes_retained() >= Arena::kFirstChunkBytes &&
+              a.bytes_retained() <= Arena::kKeepMaxBytes,
+          "arena reset retains one small chunk");
+    a.reset();
+    check(a.bytes_in_use() == 0 && a.chunk_count() == 1, "arena reset reclaims");
+    const auto v4 = a.store("after-reset");
+    check(v4 == "after-reset", "arena usable after reset");
+    const auto m = a.store("movable");
+    Arena b = std::move(a);
+    check(m == "movable", "arena views survive move");
+    // oversized request → dedicated chunk, reset drops it (> keep cap)
+    const std::string huge(64 * 1024, 'h');
+    (void)b.store(huge);
+    const std::size_t before = b.bytes_retained();
+    b.reset();
+    check(b.bytes_retained() <= before && b.bytes_in_use() == 0,
+          "arena reset drops oversized chunks");
+  }
+
+  // ---- allocation-count regressions (fw/detail/mem_probe.hpp) -----------------
+  {
+    using fw::detail::MemProbe;
+    // warm-up (one-time growth, thread-local date cache)
+    {
+      Request r;
+      r.target = "/a/b?x=1&y=2&z=3";
+      (void)init_request_target(r);
+    }
+    std::int64_t n = -1;
+    {
+      MemProbe pr;
+      Request r;
+      r.target = "/a/b?x=1&y=2&z=3";
+      (void)init_request_target(r);
+      check(r.query_param("x") && *r.query_param("x") == "1",
+            "probe target parsed");
+      n = pr.allocs();
+    }
+    check(n <= 6, "request-target parse allocations <= 6");
+    if (n > 0)
+      std::fprintf(stderr, "  (probe: target parse = %lld allocs)\n",
+                   static_cast<long long>(n));
   }
 
   // router
@@ -113,18 +277,21 @@ bool run_selftest() {
       rt.add("POST", "/posts", Handler{[](HttpCtx&) -> asio::awaitable<void> { co_return; }});
     } catch (...) { ok = false; }
     check(ok, "router add");
-    std::map<std::string, std::string, std::less<>> p;
+    Fields p;
+    auto pget = [&p](std::string_view k) -> const std::string* {
+      return field_get(p, k);
+    };
     bool mismatch = false;
     check(rt.match("GET", "/", p, mismatch) != nullptr, "router static");
     const Router::Route* r1 = rt.match("GET", "/posts/77", p, mismatch);
-    check(r1 != nullptr && p["id"] == "77", "router param");
+    check(r1 != nullptr && pget("id") && *pget("id") == "77", "router param");
     check(rt.match("GET", "/posts/-1", p, mismatch) == nullptr, "router typed reject");
     mismatch = false;
     check(rt.match("DELETE", "/posts", p, mismatch) == nullptr && mismatch,
           "router 405");
     p.clear();
     const Router::Route* r2 = rt.match("GET", "/files/a/b/c", p, mismatch);
-    check(r2 != nullptr && p["rest"] == "a/b/c", "router wildcard");
+    check(r2 != nullptr && pget("rest") && *pget("rest") == "a/b/c", "router wildcard");
     check(rt.match("GET", "/nope", p, mismatch) == nullptr && !mismatch, "router 404");
     bool threw = false;
     try { rt.add("GET", "/bad<>", Handler{}); } catch (...) { threw = true; }

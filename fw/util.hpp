@@ -85,14 +85,25 @@ inline std::int64_t now_ms() {
       .count();
 }
 
-inline std::string http_date_now() {
+// RFC 9110 HTTP-date (IMF-fixdate). The value changes once per second, so
+// each thread caches the formatted string and refreshes it lazily — the
+// per-response cost is one clock read and, 99.999% of the time, no
+// allocation, no gmtime syscall, no strftime.
+inline std::string_view http_date_now() {
+  struct Dated {
+    std::time_t t = -1;
+    char buf[40] = {};
+  };
+  thread_local Dated d;
   const std::time_t tt = std::chrono::system_clock::to_time_t(
       std::chrono::system_clock::now());
-  std::tm tm{};
-  fw_gmtime(tt, tm);
-  char buf[40];
-  std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-  return buf;
+  if (tt != d.t || d.t == -1) {
+    d.t = tt;
+    std::tm tm{};
+    fw_gmtime(tt, tm);
+    std::strftime(d.buf, sizeof(d.buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+  }
+  return {d.buf, std::strlen(d.buf)};
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +119,21 @@ inline std::string to_lower_ascii(std::string_view in) {
   std::transform(in.begin(), in.end(), out.begin(),
                  [](unsigned char c) { return ascii_lower(char(c)); });
   return out;
+}
+
+// Lowercase-append into an existing buffer (no temporary string). Response
+// serializers use this for every header they emit.
+inline void append_lower_ascii(std::string& out, std::string_view in) {
+  out.reserve(out.size() + in.size());
+  for (char c : in) out.push_back(ascii_lower(c));
+}
+
+// Append with CR/LF/NUL stripped (header-injection defense) — the zero-copy
+// form of sanitize_header_value().
+inline void append_sanitized(std::string& out, std::string_view in) {
+  out.reserve(out.size() + in.size());
+  for (char c : in)
+    if (c != '\r' && c != '\n' && c != '\0') out.push_back(c);
 }
 
 inline bool ieq_ascii(std::string_view a, std::string_view b) {

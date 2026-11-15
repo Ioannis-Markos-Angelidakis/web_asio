@@ -21,7 +21,9 @@ void print_usage() {
       "  --port N          TCP port (default 8080)\n"
       "  --bind ADDR       bind address (default 0.0.0.0)\n"
       "  --docroot DIR     static file root (default ./public)\n"
-      "  --threads N       io threads (default: min(hw, 8))\n"
+      "  --threads N       io threads (default: auto — clamp(cores, 2, 16))\n"
+      "  --blocking-threads N  blocking pool for file I/O and blocking\n"
+      "                    handler work (default: auto — clamp(cores/4, 2, 8))\n"
       "  --tls-cert FILE   TLS certificate chain (PEM)\n"
       "  --tls-key FILE    TLS private key (PEM)\n"
       "  --strict-tls      refuse plaintext HTTP on the TLS port\n"
@@ -51,6 +53,8 @@ ServerConfig parse_args(int argc, char** argv) {
     else if (a == "--bind") cfg.bind_addr = std::string(next());
     else if (a == "--docroot") cfg.docroot = std::string(next());
     else if (a == "--threads") cfg.threads = parse_num<int>(next()).value_or(0);
+    else if (a == "--blocking-threads")
+      cfg.blocking_threads = parse_num<int>(next()).value_or(0);
     else if (a == "--tls-cert") cfg.tls_cert = std::string(next());
     else if (a == "--tls-key") cfg.tls_key = std::string(next());
     else if (a == "--no-h2c") cfg.allow_h2c = false;
@@ -82,6 +86,15 @@ int run_main(int argc, char** argv) {
   if (cfg.verbose) g_log_level.store(LogLevel::Debug);
 
   asio::io_context ioc;
+  // Size the pools BEFORE any handler can touch them (the blocking pool
+  // freezes its size at first use). Policy + rationale: fw/config.hpp.
+  const unsigned n = cfg.threads > 0 ? static_cast<unsigned>(cfg.threads)
+                                     : auto_io_threads();
+  const unsigned nblk = cfg.blocking_threads > 0
+                            ? static_cast<unsigned>(cfg.blocking_threads)
+                            : auto_blocking_threads();
+  App::configure_blocking_pool(nblk);
+  const unsigned hw = std::thread::hardware_concurrency();
   auto hub = std::make_shared<chat::ChatHub>(ioc.get_executor());
   hub->start();
 
@@ -119,6 +132,10 @@ int run_main(int argc, char** argv) {
       false;
 #endif
   const std::string scheme = tls_on ? "https" : "http";
+  log(LogLevel::Info, "  pools  : {} io thread{} ({} cores detected), "
+                      "{} blocking-pool thread{} — --threads/--blocking-threads to override",
+      n, n == 1 ? "" : "s", hw ? std::to_string(hw) : std::string("?"), nblk,
+      nblk == 1 ? "" : "s");
   log(LogLevel::Info, "fw server listening on {}:{}  (chat UI: {}://localhost:{}/)",
       cfg.bind_addr, cfg.port, scheme, cfg.port);
   log(LogLevel::Info, "  HTTP/2 : {}", h2mode);
@@ -192,14 +209,14 @@ int run_main(int argc, char** argv) {
     signals.async_wait([&](asio::error_code, int) { ioc.stop(); });
   });
 
-  const unsigned n = cfg.threads > 0
-                         ? static_cast<unsigned>(cfg.threads)
-                         : std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
   std::vector<std::thread> pool;
-  pool.reserve(n - 1);
+  pool.reserve(n > 0 ? n - 1 : 0);
   for (unsigned i = 1; i < n; ++i) pool.emplace_back([&ioc] { ioc.run(); });
   ioc.run();
   for (auto& t : pool) t.join();
+  // The blocking pool is a process-lifetime static (it must outlive the
+  // io_context so late completions drain safely at exit); ioc.run() has
+  // returned, its threads finish their queued work during static teardown.
   log(LogLevel::Info, "stopped cleanly");
   return 0;
 }

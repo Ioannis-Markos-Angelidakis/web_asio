@@ -8,7 +8,11 @@ concerns. Two libraries are vendored so nothing has to be installed:
 standalone Asio 1.34.2 (I/O) and simdjson 5.1.1 (the heavily-optimized
 SIMD JSON parser behind `fw::json::parse`). The only system dependency is
 OpenSSL, and only for TLS (build with `FW_TLS=0` and even that disappears
-— h2c + HTTP/1.1 are pure). This tree is the one to develop in.
+— h2c + HTTP/1.1 are pure). The hot paths are allocation-audited: an
+arena backs HPACK decode, request metadata is flat + SSO-friendly, and a
+counting-probe selftest fails if per-request allocation churn regresses
+(see §Threading model and §Memory management). This tree is the one to
+develop in.
 
 ## Layout
 
@@ -17,14 +21,21 @@ fw/                     the reusable protocol library (namespace fw)
 ├── fw.hpp              umbrella include — apps just include this
 ├── detail/base.hpp     common includes + build flags (ASIO_STANDALONE, …)
 ├── util.hpp            clocks/timeouts, logging, string & number helpers,
-│                       percent-decoding, random tokens, server_id()
+│                       percent-decoding, random tokens, server_id(),
+│                       cached Date header (per-second, thread-local)
+├── arena.hpp           Arena — chunked monotonic (bump) allocator with
+│                       move-safe chunks and reset-retention; backs HPACK
+│                       decode and other short-lived bulk-freed data
 ├── json.hpp            JSON Value model + serializer (parse is delegated
 │                       to the bundled simdjson — see json_parse.cpp)
 ├── multipart.hpp       strict RFC 2046 multipart/form-data parser
-├── message.hpp         Request / Response, status text, MIME, SSE framing,
-│                       target parsing (shared by h1 and h2)
+├── message.hpp         Request / Response (flat, SSO-friendly field lists),
+│                       status text, MIME, SSE framing, target parsing
+│                       (shared by h1 and h2)
 ├── limits.hpp          every size cap and clock (enforced pre-allocation)
-├── config.hpp          ServerConfig (bind/port/docroot/tls/flags)
+├── config.hpp          ServerConfig + the thread-pool sizing policy
+│                       (auto_io_threads / auto_blocking_threads)
+├── detail/mem_probe.hpp allocation-counting probe for the self-tests
 ├── latch.hpp           one-shot async event
 ├── out_stream.hpp      OutStream — bounded channel, single drain coroutine,
 │                       natural backpressure (the SSE/streaming heart)
@@ -44,8 +55,9 @@ fw/                     the reusable protocol library (namespace fw)
 │                       bomb-proof decode caps — pure, no asio
 ├── h2_conn.hpp         the HTTP/2 connection engine: stream state machine,
 │                       flow control (conn + per-stream windows), CONTINUATION
-│                       reassembly, SETTINGS/PING/GOAWAY, multiplexed DATA —
-│                       pure + asio-free, unit-testable headless
+│                       reassembly, SETTINGS/PING/GOAWAY, multiplexed DATA,
+│                       arena-backed HPACK decode + O(n) output/sendq
+│                       cursors — pure + asio-free, unit-testable headless
 ├── prefaced_stream.hpp replays sniffed bytes into the TLS handshake (#if FW_TLS)
 ├── http1_session.hpp    fw::h1 — hardened parser, keep-alive, 100-continue
 ├── http2_session.hpp   fw::h2 — asio adapter around h2_conn: strand, pump
@@ -62,11 +74,14 @@ app/                    the chat demo application (namespace fw::chat)
 │                       → token → SSE attach), history, private chats, flood control
 ├── chat_routes.hpp     declares wire()
 ├── chat_routes.cpp     every chat/upload route
-├── selftest.cpp        61 unit tests (json, multipart, router, parsing, hygiene)
-├── selftest_h2.cpp     28 HTTP/2 tests: RFC 7541 Appendix C conformance
+├── selftest.cpp        74 unit tests (json, multipart, router, parsing,
+│                       hygiene, arena, Date cache) + the global allocation
+│                       probe (operator new hooks — see §Memory management)
+├── selftest_h2.cpp     37 HTTP/2 tests: RFC 7541 Appendix C conformance
 │                       (Huffman, dynamic-table reuse + eviction), framing,
 │                       engine scenarios (PING, flow windows, REFUSED_STREAM,
-│                       COMPRESSION_ERROR → GOAWAY)
+│                       COMPRESSION_ERROR → GOAWAY), allocation-count
+│                       regression, fragmented-consume cursor regression
 └── main.cpp            CLI, bootstrap, signals, thread pool
 
 examples/
@@ -150,7 +165,8 @@ curl --http1.1 http://localhost:8443/health
 | `--port N`          | 8080               | TCP port to listen on                              |
 | `--bind ADDR`       | 0.0.0.0            | bind address (`127.0.0.1` = LAN-invisible)         |
 | `--docroot DIR`     | ./public           | static file root; missing dir → static serving off |
-| `--threads N`       | min(hardware, 8)   | io threads sharing one `io_context`                |
+| `--threads N`       | auto: clamp(cores, 2, 16) | io threads sharing one `io_context` |
+| `--blocking-threads N` | auto: clamp(cores/4, 2, 8) | blocking pool for file I/O and offloaded handler work (see §Threading model) |
 | `--tls-cert FILE`   | —                  | PEM certificate chain; enables TLS + ALPN h2       |
 | `--tls-key FILE`    | —                  | PEM private key (cert **and** key, or no TLS)      |
 | `--strict-tls`      | off                | refuse plaintext HTTP on the TLS port (default: plaintext is sniffed and served too) |
@@ -159,7 +175,7 @@ curl --http1.1 http://localhost:8443/health
 | `--max-body BYTES`  | 1048576 (1 MiB)    | per-request body cap → 413 (h1) / RST (h2)         |
 | `--max-upload N`    | 52428800 (50 MiB)  | `/chat/upload` route cap                           |
 | `--verbose`         | off                | debug logging (per-request h1/h2 lines included)   |
-| `--selftest`        | —                  | run the 89 unit tests and exit 0/1                 |
+| `--selftest`        | —                  | run the 111 unit tests and exit 0/1               |
 | `--help`, `-h`      | —                  | usage text                                         |
 
 One port, three protocols: the first bytes of every connection are sniffed
@@ -220,6 +236,131 @@ only the two most common as CLI flags (see above).
 | h2 idle               | 300 s     | close idle h2 connection                   |
 | TLS handshake         | 10 s      | abort stalled handshake                    |
 | whole-request deadline| 30 s      | slowloris defense: kill stuck requests     |
+
+## Threading model
+
+Two pools, one rule: **io threads never block.**
+
+| pool            | default (auto)             | runs                                             |
+|-----------------|----------------------------|--------------------------------------------------|
+| io threads      | `clamp(cores, 2, 16)`      | one shared `io_context`; accept, all sockets, timers, handlers (coroutines) |
+| blocking pool   | `clamp(cores/4, 2, 8)`     | static-file reads and anything a handler offloads |
+
+Sizing rationale (`fw/config.hpp`, overridable per boot):
+
+* Socket work is non-blocking and coroutine-based, so io threads beyond
+  core count only add cache/mutex traffic — the ceiling is 16, not "all
+  cores", because a 2-vCPU container that reports its host's 128 cores
+  must not spawn 128 event-loop threads. The floor of 2 keeps accept and
+  timers off a single hot thread; `hardware_concurrency()==0` (unknown)
+  falls back to 4.
+* The blocking pool serves disk I/O and user offloads — disk-bound, not
+  CPU-bound — hence `cores/4` clamped to `[2, 8]`.
+* Every connection (and thus every h2 stream) is fenced by a strand;
+* the engine's invariant "one coroutine writes to the socket" (h2 `pump_`,
+  h1 writer) is preserved in both pools' presence.
+
+Static files already run there (`App::blocking_pool()`), and your handlers
+can offload their own blocking work the same way:
+
+```cpp
+std::string data = co_await asio::co_spawn(
+    fw::App::blocking_pool().get_executor(),
+    []() -> asio::awaitable<std::string> {
+      co_return read_whatever_blocks();     // DB query, disk, subprocess…
+    },
+    asio::use_awaitable);                   // resumes on the connection strand
+```
+
+The pool is sized at first use and frozen (`App::configure_blocking_pool(n)`
+must run before that — main.cpp does it during bootstrap). It is a
+process-lifetime static *on purpose*: it must outlive the `io_context` so
+completions that race with shutdown still drain during static destruction
+instead of touching a dead executor.
+
+Startup prints the chosen sizes:
+
+```
+[..] pools  : 4 io threads (8 cores detected), 2 blocking-pool threads — --threads/--blocking-threads to override
+```
+
+## Memory management
+
+The allocation story is **bounded buffers, arena scratch, flat metadata,
+O(n) cursors** — with allocation counts enforced by regression tests.
+
+### Where allocations actually happen now
+
+| path                                     | allocations (measured, `--selftest` prints them) |
+|------------------------------------------|--------------------------------------------------|
+| request-target + query parse (3 params)  | 4 (one `Fields` vector growth + non-SSO strings) |
+| warm h2 request/response cycle, 8-header request | 4–6 steady state: 1 stream map node, 1 sendq slot, amortized output growth |
+| h1 response serialization (any header count) | 0 steady state (capacity reused; only larger-than-before bodies grow the buffer) |
+| HPACK header decode, any block size      | 0 after the connection's first block (arena bump) |
+
+### The pieces
+
+* **`fw/arena.hpp` — chunked monotonic arena.** HPACK decode and header-block
+  assembly bump-allocate from a per-connection arena (4 KiB first chunk);
+  decoded fields are handed to the session as `string_view`s — no
+  per-string `std::string` copies. `reset()` (per header block) frees all
+  chunks but retains one ≤ 16 KiB chunk, so a warm connection decodes
+  header blocks with zero heap traffic while pathological blocks still
+  release their memory. Chunks are heap blocks owned by `unique_ptr` and
+  transferred wholesale on move — arena-stable views survive moves, which
+  is the property a stack-embedded `std::pmr::monotonic_buffer_resource`
+  does *not* give you (that is why this class exists instead of PMR).
+* **Flat field lists, not maps.** `Request` headers/query/params are
+  `std::vector<pair<string,string>>` (≤ 100 entries, SSO covers typical
+  names/values): one contiguous buffer instead of a red-black node +
+  rebalancing per entry, insertion order preserved, `set_*` keeps the old
+  "last write wins" duplicate semantics. Same change in `Router::match`.
+* **Two O(n²) memmove patterns fixed in the h2 engine.** `out_.erase(0, n)`
+  after every write and `sendq.front().erase(0, n)` after every frame each
+  moved the whole remaining buffer — ~32 MB of memmove per MB streamed.
+  Both are now cursor-based (`consume()` compacts only past 64 KiB, the
+  sendq advances `sq_pos` and pops only fully-sent chunks), verified by a
+  selftest that drains 200 KiB through a 64 KiB window in odd-sized slices
+  that split frames mid-payload and checks the reassembled byte stream is
+  intact frames end-to-end.
+* **`std::deque` removed from the per-stream hot path.** libstdc++'s deque
+  eagerly allocates ~576 B on construction *and on move* — opening a
+  stream used to cost 3 avoidable allocations before any payload existed.
+  The engine's send queue is now a minimal vector-based ring (allocates
+  nothing until a chunk is actually queued), and streams are constructed
+  in place (`map::try_emplace`).
+* **Response serialization is allocation-free on a warm connection.**
+  h1 keeps a per-connection `wbuf_` (clear-keeps-capacity), writes status
+  and content-length with `std::to_chars`, appends header lines with inline
+  lowercasing and CRLF-stripping (no `sanitize_header_value`/
+  `to_lower_ascii` temporaries), and takes the `Date` header from a
+  per-second thread-local cache (no `gmtime`+`strftime`+string per
+  response). h2 reuses an assign-in-place header store (`hstore_`) whose
+  strings keep their capacity across responses.
+* **Per-request `make_shared<cancellation_signal>` eliminated** — h1 re-arms
+  one signal per connection (requests are strictly sequential); h2 embeds
+  the signal in the stream record the session already owns.
+* **Everything untrusted is capped before allocation** (see the limits
+  table above): header bombs die at 32 KiB/100 fields *during* HPACK
+  decode, bodies at the route limit before buffering, h2 send queues at
+  the flow-control high-water mark, SSE outboxes at 32 frames.
+
+### The allocation probe (and what it guarantees)
+
+`app/selftest.cpp` installs counting global `operator new`/`delete`
+(plain, array, aligned and nothrow overloads — all forwarding to
+`malloc`, inert unless a probe is active, one relaxed atomic load each).
+The selftests assert the *measured* counts above, so a change that quietly
+re-introduces per-header or per-frame allocation churn fails CI instead of
+just being slow. The server binary carries the hooks but never activates
+them; production behavior is `malloc`-forwarding identical to the
+defaults.
+
+Deliberate non-goals: no global allocator replacement in library code, no
+PMR types in the public API (move-safety + SSO already cover our sizes),
+no buffer pooling across connections (bounded channels + flow control are
+the backpressure story; pooling would trade correctness surface for
+little gain at these sizes).
 
 ## Windows
 
@@ -381,12 +522,16 @@ single-file edition; if the app loop matters, build this one.
 
 ## Verified state
 
-* `--selftest`: **89/89** — 61 general (json, multipart, router, parsing,
-  hygiene) + 28 HTTP/2 (RFC 7541 Appendix C conformance incl. Huffman and
-  dynamic-table eviction, framing, engine scenarios: PING echo, flow-window
-  accounting, REFUSED_STREAM, COMPRESSION_ERROR → GOAWAY). The JSON tests
-  (escapes, surrogate pairs, trailing garbage, lone surrogates, single
-  quotes) all run through the bundled simdjson backend now.
+* `--selftest`: **111/111** — 74 general (json, multipart, router, parsing,
+  hygiene, arena lifetime/stability/retention, cached Date header,
+  allocation-count regressions) + 37 HTTP/2 (RFC 7541 Appendix C
+  conformance incl. Huffman and dynamic-table eviction, framing, engine
+  scenarios: PING echo, flow-window accounting, REFUSED_STREAM,
+  COMPRESSION_ERROR → GOAWAY, warm-cycle allocation counts, fragmented
+  `consume()` cursor drain). The JSON tests (escapes, surrogate pairs,
+  trailing garbage, lone surrogates, single quotes) all run through the
+  bundled simdjson backend. `--selftest` also prints the measured
+  allocation counts (see §Memory management).
 * JSON: parsing is delegated to bundled simdjson 5.1.1 (official upstream
   single-header artifact, unmodified). `fw::json::parse` semantics are
   unchanged — insertion-ordered objects, duplicate keys preserved (find()
@@ -398,24 +543,36 @@ single-file edition; if the app loop matters, build this one.
   real flow-control windows, `expect: 100-continue` (interim `:status 100`
   verified on the wire), TLS/ALPN h2, 105-stream floods (exactly 5 refused),
   malformed HPACK → GOAWAY(9)
+* threading/memory E2E (re-run after the arena/cursor pass, 28 checks):
+  h1 keep-alive×3 on one connection, HEAD parity, h2c multiplexed stream
+  ids, token-authenticated multipart uploads over h1 *and* h2c, SSE
+  welcome/token/send delivery, **8 MiB random-blob downloads with SHA-256
+  verification over h1, h2c and h2-over-TLS** (exercises the output-cursor
+  and sendq-offset paths past every compaction threshold), plaintext-on-
+  TLS-port sniffing, SSE over h2+TLS, graceful SIGTERM shutdown
 * full SSE chat-flow suite (raw-socket clients): welcome/token handshake,
   409 duplicates, 400-vs-401 auth split (malformed body vs unknown token),
   token-owner attribution (impersonation rejected), private chat lifecycle
   (request → accept → unique `private_<id>` stream → messages → ended),
   history replay, stale-token rejection, SVG upload blocked from inline
   view, path-traversal attempts never leak files
-* ASan+UBSan (`make -j webfw_san`, now parallel per-TU objects incl. the
-  simdjson TU): the entire matrix above runs with zero sanitizer reports
-  (it caught three real lifetime bugs during development: a Huffman-tree
-  reallocation UAF, a dangling `H2EngineLimits&` temporary, and a
-  send-buffer reallocation during in-flight writes — all fixed)
+* ASan+UBSan (`make webfw_san`, now parallel per-TU objects incl. the
+  simdjson TU): the entire matrix above plus a dedicated sanitizer battery
+  (h1, h2c, h1-over-TLS, h2-over-TLS, SSE, upload, 6 MiB blob ×2
+  transports) runs with **zero sanitizer reports**. During development it
+  caught four real lifetime bugs: a Huffman-tree reallocation UAF, a
+  dangling `H2EngineLimits&` temporary, a send-buffer reallocation during
+  in-flight writes, and (this pass) an alloc-dealloc mismatch in the
+  probe's nothrow-new coverage — all fixed.
 * every `fw/*.hpp` compiles standalone (include hygiene)
 * `examples/hello.cpp` builds (see the one-liner above) and serves h1, h2c
-  and SSE-over-h2c
+  and SSE-over-h2c (route params verified over both protocols)
 * both CMake configurations (Release and Debug) configured, built and run
 * Windows routes: previously user-verified with nghttp2; the pure-C++ engine
   removes the nghttp2 dependency entirely, and simdjson is bundled (also
   officially supports MSVC 2019+ and MinGW; CMake adds `/bigobj` for MSVC's
   amalgamated TU), so Routes 2–4 now need OpenSSL only for TLS
   (compile-ready by audit — same guarded-POSIX code, MSVC `/std:c++latest`
-  mapping, ws2_32/mswsock linking)
+  mapping, ws2_32/mswsock linking; the new code follows the same rules:
+  `fw_localtime/fw_gmtime` shims, `_aligned_malloc`/`_aligned_free` behind
+  `_WIN32` in the probe, no new platform APIs)

@@ -35,6 +35,9 @@ namespace fw::h2 {
 // Per-stream record (session side). The outbound byte stream lives in the
 // engine's per-stream queue; the session mirrors what the handler needs:
 // the request, its limits, the SSE OutStream and its pacing primitives.
+// The cancellation signal is embedded (not make_shared) — the record is
+// already shared_ptr-managed, and pending_cancel_ keeps whole records alive
+// until their deferred emit.
 struct H2StreamRec {
   std::uint32_t id = 0;
   Request req;
@@ -45,7 +48,7 @@ struct H2StreamRec {
   bool dispatched = false;
   bool dead = false;              // stream closed (RST / error)
   bool response_sent = false;
-  std::shared_ptr<asio::cancellation_signal> cancel;
+  asio::cancellation_signal cancel_sig;  // emitted after close (deferred)
   std::shared_ptr<OutStream> out;
   std::shared_ptr<Latch> drain_done;
   // Signalled by the engine when the send queue drains to empty; the drain
@@ -165,37 +168,42 @@ class Http2Session final : public ServerHooks,
     if (!rec || rec->dead) co_return;
     Response& r = ctx.res;
     const bool head = (ctx.req.method == "HEAD");
-    std::vector<std::pair<std::string, std::string>> hstore;
-    hstore.emplace_back(":status", std::to_string(r.status));
+    char nb[24];
+    hreset_();
+    {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), r.status);
+      status_val_.assign(nb, std::size_t(p - nb));
+    }
+    hput_(":status", status_val_);
     bool explicit_cl = false;
     for (const auto& [k, v] : r.headers) {
-      std::string lk = to_lower_ascii(k);
-      if (lk == "content-length") {
+      if (ieq_ascii(k, "content-length")) {
         explicit_cl = true;
-        hstore.emplace_back("content-length", sanitize_header_value(v));
+        hput_("content-length", v);
         continue;
       }
-      if (lk == "connection" || lk == "transfer-encoding" ||
-          lk == "keep-alive" || lk == "upgrade" || lk == "proxy-connection")
+      if (ieq_ascii(k, "connection") || ieq_ascii(k, "transfer-encoding") ||
+          ieq_ascii(k, "keep-alive") || ieq_ascii(k, "upgrade") ||
+          ieq_ascii(k, "proxy-connection"))
         continue;  // connection-specific headers are illegal in h2
-      hstore.emplace_back(std::move(lk), sanitize_header_value(v));
+      hput_(k, v);
     }
-    hstore.emplace_back("content-type", sanitize_header_value(r.content_type));
-    if (!explicit_cl)
-      hstore.emplace_back("content-length", std::to_string(r.body.size()));
-    hstore.emplace_back("date", http_date_now());
-    hstore.emplace_back("server", server_id());
-
-    std::vector<std::pair<std::string_view, std::string_view>> nva;
-    nva.reserve(hstore.size());
-    for (const auto& [n, v] : hstore) nva.emplace_back(n, v);
+    hput_("content-type", r.content_type);
+    if (!explicit_cl) {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), r.body.size());
+      status_val_.assign(nb, std::size_t(p - nb));
+      hput_("content-length", status_val_);
+    }
+    hput_("date", http_date_now());
+    hput_("server", server_id());
+    hbind_nva_();
 
     if (head || r.body.empty()) {
-      eng_.submit_response(rec->id, nva, /*end_stream=*/true);
+      eng_.submit_response(rec->id, nva_, /*end_stream=*/true);
     } else {
       // Open HEADERS (no END_STREAM), then the body as DATA frames whose
       // last one carries END_STREAM (EOF after the queue drains).
-      eng_.submit_response(rec->id, nva, /*end_stream=*/false);
+      eng_.submit_response(rec->id, nva_, /*end_stream=*/false);
       eng_.submit_data(rec->id, std::move(r.body), /*end_after=*/true);
     }
     rec->response_sent = true;
@@ -220,25 +228,28 @@ class Http2Session final : public ServerHooks,
     ctx.streaming = true;
     ctx.res.status = status;
 
-    std::vector<std::pair<std::string, std::string>> hstore;
-    hstore.emplace_back(":status", std::to_string(status));
-    for (const auto& [k, v] : headers) {
-      std::string lk = to_lower_ascii(k);
-      if (lk == "connection" || lk == "transfer-encoding" || lk == "content-length")
-        continue;
-      hstore.emplace_back(std::move(lk), sanitize_header_value(v));
+    hreset_();
+    {
+      char nb[24];
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), status);
+      status_val_.assign(nb, std::size_t(p - nb));
     }
-    hstore.emplace_back("content-type", sanitize_header_value(content_type));
-    hstore.emplace_back("date", http_date_now());
-    hstore.emplace_back("server", server_id());
-    std::vector<std::pair<std::string_view, std::string_view>> nva;
-    nva.reserve(hstore.size());
-    for (const auto& [n, v] : hstore) nva.emplace_back(n, v);
+    hput_(":status", status_val_);
+    for (const auto& [k, v] : headers) {
+      if (ieq_ascii(k, "connection") || ieq_ascii(k, "transfer-encoding") ||
+          ieq_ascii(k, "content-length"))
+        continue;
+      hput_(k, v);
+    }
+    hput_("content-type", content_type);
+    hput_("date", http_date_now());
+    hput_("server", server_id());
+    hbind_nva_();
 
     // Open the stream: HEADERS *without* END_STREAM — data follows as DATA
     // frames. (END_STREAM here would close the stream immediately, which
     // would be wrong for SSE.)
-    eng_.submit_response(rec->id, nva, /*end_stream=*/false);
+    eng_.submit_response(rec->id, nva_, /*end_stream=*/false);
     rec->response_sent = true;
     last_status_ = status;
 
@@ -280,9 +291,9 @@ class Http2Session final : public ServerHooks,
     if (n.empty()) return;
     if (n[0] == ':') {
       if (rec->headers_done) return;  // pseudo after regular → refuse? keep first
-      if (n == ":method") rec->req.method = std::string(v);
-      else if (n == ":path") rec->req.target = std::string(v);
-      else if (n == ":authority") rec->req.headers["host"] = std::string(v);
+      if (n == ":method") rec->req.method.assign(v);
+      else if (n == ":path") rec->req.target.assign(v);
+      else if (n == ":authority") rec->req.set_header("host", std::string(v));
       else if (n == ":scheme") { /* unused */ }
       return;
     }
@@ -293,7 +304,7 @@ class Http2Session final : public ServerHooks,
       return;
     }
     rec->hdr_bytes += n.size() + v.size();
-    rec->req.headers[to_lower_ascii(n)] = std::string(v);
+    rec->req.set_header(to_lower_ascii(n), std::string(v));
   }
 
   void on_headers_end(std::uint32_t id, bool end_stream,
@@ -305,11 +316,11 @@ class Http2Session final : public ServerHooks,
     }
     // Header block complete (incl. CONTINUATION): the target is known —
     // refine the body limit before any DATA can arrive.
-    Request probe;
-    probe.method = rec->req.method;
-    probe.target = rec->req.target;
-    if (!init_request_target(probe))
-      rec->body_limit = app_.body_limit_for(probe.method, probe.path);
+    probe_.method.assign(rec->req.method);
+    probe_.target.assign(rec->req.target);
+    probe_.query.clear();
+    if (!init_request_target(probe_))
+      rec->body_limit = app_.body_limit_for(probe_.method, probe_.path);
     // "expect: 100-continue" — answer early so the client does not sit out
     // its timeout before sending the body.
     if (!end_stream) {
@@ -344,7 +355,7 @@ class Http2Session final : public ServerHooks,
     if (rec->dispatched) live_dispatched_--;
     rec->dead = true;
     if (rec->out) rec->out->close();          // wake handler + drain
-    if (rec->cancel) pending_cancel_.push_back(rec->cancel);
+    pending_cancel_.push_back(rec);           // emit after we leave the engine
     if (error_code != frame::kNoError)
       log(LogLevel::Debug, "h2 stream {} closed: {}", id, error_code);
   }
@@ -397,13 +408,13 @@ class Http2Session final : public ServerHooks,
 
   void close_all_streams_() {
     if (streams_.empty()) return;
-    std::vector<std::shared_ptr<asio::cancellation_signal>> cancels;
+    std::vector<std::shared_ptr<H2StreamRec>> cancels;
     cancels.reserve(streams_.size());
     for (auto& [id, rec] : streams_) {
       rec->dead = true;
       if (rec->dispatched) --live_dispatched_;
       if (rec->out) rec->out->close();  // wake SSE handler → hub detach
-      if (rec->cancel) cancels.push_back(rec->cancel);
+      cancels.push_back(rec);
       log(LogLevel::Debug, "h2 reaping stream {} (session end)", id);
     }
     streams_.clear();
@@ -428,10 +439,46 @@ class Http2Session final : public ServerHooks,
     return it == streams_.end() ? nullptr : it->second.get();
   }
 
+  // ---- response-header serialization scratch ----------------------------------
+  // hstore_ entries are reused by assignment (clear() would destroy the
+  // strings' capacity): a warm connection serializes response headers with
+  // zero heap traffic. nva_ re-binds views over the live prefix every time.
+  struct HEntry {
+    std::string k, v;
+  };
+  std::vector<HEntry> hstore_;
+  std::size_t hcount_ = 0;
+  std::vector<std::pair<std::string_view, std::string_view>> nva_;
+  std::string status_val_;  // ":status" / "content-length" number scratch
+  Request probe_;           // reused body-limit probe (on_headers_end)
+
+  void hreset_() { hcount_ = 0; }
+
+  void hput_(std::string_view k, std::string_view v) {
+    HEntry* e;
+    if (hcount_ < hstore_.size()) {
+      e = &hstore_[hcount_];
+    } else {
+      hstore_.emplace_back();
+      e = &hstore_.back();
+    }
+    e->k.clear();
+    e->v.clear();
+    append_lower_ascii(e->k, k);   // names lower-cased (as before)
+    append_sanitized(e->v, v);     // CR/LF/NUL stripped (as before)
+    ++hcount_;
+  }
+
+  void hbind_nva_() {
+    nva_.clear();
+    for (std::size_t i = 0; i < hcount_; ++i)
+      nva_.emplace_back(hstore_[i].k, hstore_[i].v);
+  }
+
   void flush_pending_cancels_() {
     if (pending_cancel_.empty()) return;
-    for (auto& sig : pending_cancel_)
-      sig->emit(asio::cancellation_type::terminal);
+    for (auto& rec : pending_cancel_)
+      rec->cancel_sig.emit(asio::cancellation_type::terminal);
     pending_cancel_.clear();
   }
 
@@ -468,7 +515,6 @@ class Http2Session final : public ServerHooks,
       eng_.submit_rst(id, frame::kRefusedStream);
       return;
     }
-    rec->cancel = std::make_shared<asio::cancellation_signal>();
     auto selfsp = this->shared_from_this();
     auto recsp = streams_.count(id) ? streams_[id] : nullptr;
     if (!recsp) return;
@@ -480,21 +526,29 @@ class Http2Session final : public ServerHooks,
                      [selfsp, recsp] -> asio::awaitable<void> {
                        co_await selfsp->stream_runner_(recsp);
                      },
-                     asio::bind_cancellation_slot(recsp->cancel->slot(),
+                     asio::bind_cancellation_slot(recsp->cancel_sig.slot(),
                                                   asio::detached));
     });
   }
 
   void submit_error_(H2StreamRec* rec, int status, const std::string& msg) {
     Response r = Response::json_error(status, msg);
-    std::vector<std::pair<std::string, std::string>> hstore;
-    hstore.emplace_back(":status", std::to_string(r.status));
-    hstore.emplace_back("content-type", r.content_type);
-    hstore.emplace_back("content-length", std::to_string(r.body.size()));
-    hstore.emplace_back("server", server_id());
-    std::vector<std::pair<std::string_view, std::string_view>> nva;
-    for (const auto& [n, v] : hstore) nva.emplace_back(n, v);
-    eng_.submit_response(rec->id, nva, /*end_stream=*/false);
+    char nb[24];
+    hreset_();
+    {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), r.status);
+      status_val_.assign(nb, std::size_t(p - nb));
+    }
+    hput_(":status", status_val_);
+    hput_("content-type", r.content_type);
+    {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), r.body.size());
+      status_val_.assign(nb, std::size_t(p - nb));
+      hput_("content-length", status_val_);
+    }
+    hput_("server", server_id());
+    hbind_nva_();
+    eng_.submit_response(rec->id, nva_, /*end_stream=*/false);
     eng_.submit_data(rec->id, std::move(r.body), /*end_after=*/true);
     rec->response_sent = true;
     rec->dispatched = true;   // never dispatch this stream again
@@ -650,7 +704,7 @@ class Http2Session final : public ServerHooks,
   asio::experimental::channel<void(asio::error_code)> write_sig_;
   Latch pump_done_;
   std::map<std::uint32_t, std::shared_ptr<H2StreamRec>> streams_;
-  std::vector<std::shared_ptr<asio::cancellation_signal>> pending_cancel_;
+  std::vector<std::shared_ptr<H2StreamRec>> pending_cancel_;  // deferred emits
   std::size_t live_dispatched_ = 0;  // streams with a running handler (SSE etc.)
   int last_status_ = 0;
   std::chrono::steady_clock::time_point progress_deadline_{};

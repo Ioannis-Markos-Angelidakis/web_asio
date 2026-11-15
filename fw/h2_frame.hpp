@@ -76,13 +76,15 @@ inline Header parse_header(const char* buf) {
   return h;
 }
 
-// Append one complete frame (header + payload) to `out`.
-inline void append(std::string& out, std::uint8_t type, std::uint8_t flags,
-                   std::uint32_t id, std::string_view payload) {
-  const std::uint32_t n = std::uint32_t(payload.size());
-  out.push_back(char(std::uint8_t(n >> 16)));
-  out.push_back(char(std::uint8_t(n >> 8)));
-  out.push_back(char(std::uint8_t(n)));
+// Header-only writer for callers that append the payload bytes themselves
+// (append() below, and the control-frame emitters further down) — the
+// length must be known up front.
+inline void append_header(std::string& out, std::uint8_t type,
+                          std::uint8_t flags, std::uint32_t id,
+                          std::uint32_t payload_len) {
+  out.push_back(char(std::uint8_t(payload_len >> 16)));
+  out.push_back(char(std::uint8_t(payload_len >> 8)));
+  out.push_back(char(std::uint8_t(payload_len)));
   out.push_back(char(type));
   out.push_back(char(flags));
   const std::uint32_t sid = id & 0x7fffffff;
@@ -90,6 +92,12 @@ inline void append(std::string& out, std::uint8_t type, std::uint8_t flags,
   out.push_back(char(std::uint8_t(sid >> 16)));
   out.push_back(char(std::uint8_t(sid >> 8)));
   out.push_back(char(std::uint8_t(sid)));
+}
+
+// Append one complete frame (header + payload) to `out`.
+inline void append(std::string& out, std::uint8_t type, std::uint8_t flags,
+                   std::uint32_t id, std::string_view payload) {
+  append_header(out, type, flags, id, std::uint32_t(payload.size()));
   out.append(payload);
 }
 
@@ -98,6 +106,27 @@ inline void append_u32(std::string& s, std::uint32_t v) {
   s.push_back(char(std::uint8_t(v >> 16)));
   s.push_back(char(std::uint8_t(v >> 8)));
   s.push_back(char(std::uint8_t(v)));
+}
+
+// Control frames with u32 (RST_STREAM, WINDOW_UPDATE) or u32+u32 (GOAWAY)
+// bodies, written directly into `out` — no temporary payload string. These
+// fire for every inbound DATA frame (WINDOW_UPDATE credit returns), so they
+// are on the hot path of every h2 upload.
+inline void append_u32_frame(std::string& out, std::uint8_t type,
+                             std::uint8_t flags, std::uint32_t id,
+                             std::uint32_t v) {
+  out.reserve(out.size() + kHeaderLen + 4);
+  append_header(out, type, flags, id, 4);
+  append_u32(out, v);
+}
+
+inline void append_u32x2_frame(std::string& out, std::uint8_t type,
+                               std::uint8_t flags, std::uint32_t id,
+                               std::uint32_t a, std::uint32_t b) {
+  out.reserve(out.size() + kHeaderLen + 8);
+  append_header(out, type, flags, id, 8);
+  append_u32(out, a);
+  append_u32(out, b);
 }
 
 // ---- payload parsers (return false when malformed) ----------------------------

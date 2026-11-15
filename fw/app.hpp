@@ -8,6 +8,7 @@
 #include "fw/detail/base.hpp"
 #include "fw/util.hpp"
 #include "fw/limits.hpp"
+#include "fw/config.hpp"
 #include "fw/latch.hpp"
 #include "fw/out_stream.hpp"
 #include "fw/hooks.hpp"
@@ -38,7 +39,7 @@ class App {
   // may accept large files.
   [[nodiscard]] std::size_t body_limit_for(std::string_view method,
                                            std::string_view path) const {
-    std::map<std::string, std::string, std::less<>> params;
+    Fields params;
     bool mismatch = false;
     if (const Router::Route* r = router_.match(method, path, params, mismatch))
       return r->max_body ? r->max_body : limits.max_body_bytes;
@@ -60,11 +61,37 @@ class App {
     co_await serve_static_(ctx, std::move(rel));
   }
 
-  // Dedicated pool for blocking file I/O so io threads never block on disk.
-  static asio::thread_pool& file_pool() {
-    static asio::thread_pool pool(2);
+  // ---- blocking-work pool ------------------------------------------------------
+  // Inherently blocking work (disk I/O for static files, and any blocking
+  // call a user handler wants to make) runs here so io threads never stall.
+  // The pool is sized at first use from the configuration (see main.cpp):
+  //   App::configure_blocking_pool(n)   — before first use; 0/auto →
+  //                                       auto_blocking_threads()
+  //   App::blocking_pool()              — the pool (static lifetime: it
+  //                                       outlives the io_context so late
+  //                                       completions still drain at exit)
+  // and handlers can offload with:
+  //   co_await asio::co_spawn(App::blocking_pool().get_executor(),
+  //                           []() -> asio::awaitable<T> {...},
+  //                           asio::use_awaitable);
+  inline static std::atomic<int> g_blocking_pool_threads{0};
+
+  static void configure_blocking_pool(unsigned n) {
+    g_blocking_pool_threads.store(int(n));  // must precede first blocking_pool()
+  }
+
+  static unsigned blocking_pool_size() {
+    const int n = g_blocking_pool_threads.load(std::memory_order_relaxed);
+    return n > 0 ? unsigned(n) : auto_blocking_threads();
+  }
+
+  static asio::thread_pool& blocking_pool() {
+    static asio::thread_pool pool(blocking_pool_size());  // size frozen here
     return pool;
   }
+
+  // Legacy alias (static file serving used to be its only customer).
+  static asio::thread_pool& file_pool() { return blocking_pool(); }
 
   // Entry point used by both protocol sessions.
   asio::awaitable<void> dispatch(HttpCtx& ctx) {

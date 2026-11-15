@@ -62,8 +62,11 @@ inline std::string_view mime_for(std::string_view path) {
   const auto dot = path.rfind('.');
   std::string_view ext;
   if (dot != std::string_view::npos) ext = path.substr(dot + 1);
-  std::string lext = to_lower_ascii(ext);
-  static const std::map<std::string, std::string_view, std::less<>> m = {
+  // Linear scan over a fixed table with an in-place case-insensitive
+  // compare: zero allocation, one cache-friendly pass — the old version
+  // lower-cased the extension into a heap string for a map lookup on every
+  // static response.
+  static constexpr std::pair<std::string_view, std::string_view> kMime[] = {
       {"html", "text/html; charset=utf-8"},
       {"htm",  "text/html; charset=utf-8"},
       {"css",  "text/css; charset=utf-8"},
@@ -90,7 +93,11 @@ inline std::string_view mime_for(std::string_view path) {
       {"mp3",  "audio/mpeg"},
       {"zip",  "application/zip"},
   };
-  if (const auto it = m.find(lext); it != m.end()) return it->second;
+  if (ext.size() <= 5) {  // longest entry is 4 — skip the scan otherwise
+    for (const auto& [e, m] : kMime) {
+      if (e.size() == ext.size() && ieq_ascii(e, ext)) return m;
+    }
+  }
   return "application/octet-stream";
 }
 
@@ -121,15 +128,40 @@ inline std::string sse_event(std::string_view event, std::string_view data,
 // ---------------------------------------------------------------------------
 // Request / Response
 // ---------------------------------------------------------------------------
+// Flat, ordered name/value storage for request metadata. Header lists are
+// small (≤ Limits::max_headers) and dominated by pointer chasing — a
+// contiguous vector of SSO strings beats std::map on allocation count (one
+// buffer instead of a red-black node + rebalancing per entry) and cache
+// behavior, and preserves insertion order. set_* keeps the old map
+// semantics: first position wins, value replaced ("last write wins").
+using Fields = std::vector<std::pair<std::string, std::string>>;
+
+inline const std::string* field_get(const Fields& f, std::string_view name) {
+  for (const auto& [k, v] : f)
+    if (k == name) return &v;
+  return nullptr;
+}
+
+// Insert or overwrite (same observable behavior as `map[key] = value`).
+inline void field_set(Fields& f, std::string name, std::string value) {
+  for (auto& [k, v] : f) {
+    if (k == name) {
+      v = std::move(value);
+      return;
+    }
+  }
+  f.emplace_back(std::move(name), std::move(value));
+}
+
 struct Request {
   int http_version = 1;                 // 1 or 2
   std::string method;                   // "GET", "POST", ...
   std::string target;                   // raw request target as received
   std::string path;                     // percent-decoded path
   std::string raw_query;                // raw query string (no '?')
-  std::map<std::string, std::string, std::less<>> headers;      // lower-cased
-  std::map<std::string, std::string, std::less<>> query;        // decoded
-  std::map<std::string, std::string, std::less<>> params;       // route params
+  Fields headers;                       // lower-cased names, insertion order
+  Fields query;                         // decoded, insertion order
+  Fields params;                        // route params, insertion order
   std::string body;
   std::string remote_addr;
   unsigned short remote_port = 0;
@@ -139,16 +171,22 @@ struct Request {
   bool keep_alive = true;
 
   const std::string* header(std::string_view name) const {
-    if (const auto it = headers.find(name); it != headers.end()) return &it->second;
-    return nullptr;
+    return field_get(headers, name);
   }
   const std::string* query_param(std::string_view name) const {
-    if (const auto it = query.find(name); it != query.end()) return &it->second;
-    return nullptr;
+    return field_get(query, name);
   }
   const std::string* raw_param(std::string_view name) const {
-    if (const auto it = params.find(name); it != params.end()) return &it->second;
-    return nullptr;
+    return field_get(params, name);
+  }
+  void set_header(std::string name, std::string value) {
+    field_set(headers, std::move(name), std::move(value));
+  }
+  void set_query(std::string name, std::string value) {
+    field_set(query, std::move(name), std::move(value));
+  }
+  void set_param(std::string name, std::string value) {
+    field_set(params, std::move(name), std::move(value));
   }
   // Typed route-parameter access (":id<uint32>") — std::expected based.
   template <class T>
@@ -246,7 +284,7 @@ inline std::optional<std::pair<int, std::string>> init_request_target(
                                 : query.substr(eq + 1, end - eq - 1);
       auto k = percent_decode(kv, true);
       auto v = percent_decode(vv, true);
-      if (k && v) req.query[*k] = std::move(*v);
+      if (k && v) req.set_query(std::move(*k), std::move(*v));
     }
     if (amp == std::string_view::npos) break;
     i = amp + 1;

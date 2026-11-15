@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "fw/arena.hpp"
 #include "fw/detail/base.hpp"
 #include "fw/h2_frame.hpp"
 #include "fw/h2_hpack.hpp"
@@ -95,13 +96,72 @@ class H2Conn {
   // ---- output -----------------------------------------------------------
   bool want_write() const;
   void produce();
-  std::string_view output() const { return out_; }
-  void consume(std::size_t n) { out_.erase(0, n); }
+  // Serialized bytes pending for the wire, from the consume cursor onwards.
+  std::string_view output() const {
+    return std::string_view(out_).substr(out_pos_);
+  }
+  // Acknowledge n written bytes. Instead of erase(0, n) — an O(remaining)
+  // memmove per write, quadratically expensive on bulk transfers — this
+  // advances a cursor and only compacts back to a fresh buffer once the
+  // consumed prefix exceeds kOutCompactBytes (same policy as rbuf_).
+  void consume(std::size_t n) {
+    out_pos_ += n;
+    if (out_pos_ == out_.size()) {
+      out_.clear();
+      out_pos_ = 0;
+    } else if (out_pos_ >= kOutCompactBytes) {
+      out_.erase(0, out_pos_);
+      out_pos_ = 0;
+    }
+  }
 
  private:
+  // Minimal chunk ring over std::vector. std::deque eagerly allocates
+  // ~576 B (map array + node buffer) on construction AND on move — which
+  // made opening an h2 stream cost three avoidable allocations before any
+  // payload existed. A vector allocates nothing until a chunk is queued,
+  // moves in three pointer steals, and the dead prefix is compacted
+  // amortized-O(1) on pop.
+  class ChunkQueue {
+   public:
+    void push_back(std::string&& s) {
+      q_.push_back(std::move(s));
+      ++size_;
+    }
+    bool empty() const { return size_ == 0; }
+    std::string& front() { return q_[head_]; }
+    void pop_front() {
+      std::string husk = std::move(q_[head_]);  // free the spent chunk now
+      (void)husk;
+      ++head_;
+      --size_;
+      if (size_ == 0) {
+        q_.clear();  // all husks — drop them, keep the vector capacity
+        head_ = 0;
+      } else if (head_ >= q_.size() / 2) {
+        compact();
+      }
+    }
+    void clear() {
+      q_.clear();
+      head_ = 0;
+      size_ = 0;
+    }
+
+   private:
+    void compact() {  // slide live elements over the dead prefix
+      std::move(q_.begin() + std::ptrdiff_t(head_), q_.end(), q_.begin());
+      q_.resize(size_);
+      head_ = 0;
+    }
+    std::vector<std::string> q_;
+    std::size_t head_ = 0, size_ = 0;
+  };
+
   struct Stream {
     std::int64_t send_window = 65535;  // our sending window (client controls)
-    std::deque<std::string> sendq;
+    ChunkQueue sendq;
+    std::size_t sq_pos = 0;         // unconsumed offset into sendq.front()
     std::size_t queued = 0;
     bool finish_after = false;   // END_STREAM once the queue drains
     bool refused = false;        // refused stream: decode, drop, RST
@@ -127,9 +187,7 @@ class H2Conn {
     return n;
   }
   void emit_window_update_(std::uint32_t id, std::uint32_t inc) {
-    std::string p;
-    frame::append_u32(p, inc);
-    frame::append(out_, frame::kWindowUpdate, 0, id, p);
+    frame::append_u32_frame(out_, frame::kWindowUpdate, 0, id, inc);
   }
   void emit_settings_ack_() {
     frame::append(out_, frame::kSettings, frame::kAck, 0, {});
@@ -157,6 +215,14 @@ class H2Conn {
   std::uint8_t headers_flags_ = 0;
   std::string fragment_;
 
+  // Per-block decode scratch, kept for the connection's lifetime: the HPACK
+  // decoded fields are arena-backed views, and the arena/vector capacities
+  // survive reset()/clear() — a warm connection decodes header blocks with
+  // zero heap traffic (bounded by max_header_bytes).
+  Arena hdr_arena_;
+  std::vector<hpack::Decoder::Field> hdr_out_;
+  std::string block_scratch_;  // ping-pong partner of fragment_ (swap, no copy)
+
   std::map<std::uint32_t, Stream> streams_;
   std::uint32_t last_client_id_ = 0;
   std::int64_t conn_send_window_ = 65535;
@@ -168,25 +234,29 @@ class H2Conn {
   bool fatal_ = false;
   bool goaway_recv_ = false;
 
+  // Serialized outbound bytes + the consume() cursor into them (see consume).
   std::string out_;
+  std::size_t out_pos_ = 0;
+  static constexpr std::size_t kOutCompactBytes = 64 * 1024;
+
+  // produce() scratch (reused across rounds)
+  std::vector<std::uint32_t> finished_;
+  // HPACK-encoded outbound header-block scratch (submit_response)
+  std::string enc_block_;
 };
 
 // ---------------------------------------------------------------------------
 inline bool H2Conn::fail_(std::uint32_t code) {
   if (fatal_) return true;
   fatal_ = true;
-  std::string p;
-  frame::append_u32(p, last_client_id_ & 0x7fffffff);
-  frame::append_u32(p, code);
-  frame::append(out_, frame::kGoaway, 0, 0, p);
+  frame::append_u32x2_frame(out_, frame::kGoaway, 0, 0,
+                            last_client_id_ & 0x7fffffff, code);
   return true;
 }
 
 inline void H2Conn::rst_close_(std::uint32_t id, std::uint32_t code) {
   if (fatal_) return;
-  std::string p;
-  frame::append_u32(p, code);
-  frame::append(out_, frame::kRstStream, 0, id, p);
+  frame::append_u32_frame(out_, frame::kRstStream, 0, id, code);
   close_sent_(id, code);
 }
 
@@ -194,6 +264,7 @@ inline void H2Conn::close_sent_(std::uint32_t id, std::uint32_t code) {
   if (const auto it = streams_.find(id); it != streams_.end()) {
     it->second.closed = true;
     it->second.sendq.clear();
+    it->second.sq_pos = 0;
     it->second.queued = 0;
     it->second.finish_after = false;
   }
@@ -453,8 +524,12 @@ inline bool H2Conn::finish_header_block_() {
   in_headers_ = false;
   const std::uint32_t id = headers_id_;
   const bool end_stream = (headers_flags_ & kEndStream) != 0;
-  const std::string block = std::move(fragment_);
-  fragment_.clear();
+  // O(1) swap instead of move-construct: the block buffer and the fragment
+  // buffer ping-pong, so both keep their capacity — no per-block allocation
+  // on a warm connection. (fragment_ is always re-assigned, never appended
+  // across blocks, so the stale bytes it receives here are harmless.)
+  block_scratch_.swap(fragment_);
+  const std::string& block = block_scratch_;
 
   Stream* st = find_(id);
   const bool first_block = !st || !st->got_first_headers;
@@ -462,7 +537,9 @@ inline bool H2Conn::finish_header_block_() {
   // Decide acceptance before decoding (decode MUST happen regardless, to
   // keep HPACK dynamic-table state in lockstep with the peer).
   if (!st) {
-    const auto [it, ok] = streams_.emplace(id, Stream{});
+    // try_emplace constructs the Stream IN the map node — no temporary, no
+    // move (the emplace(id, Stream{}) form paid a full move construction).
+    const auto [it, ok] = streams_.try_emplace(id);
     (void)ok;
     st = &it->second;
     st->send_window = std::int64_t(peer_initial_window_);
@@ -476,9 +553,14 @@ inline bool H2Conn::finish_header_block_() {
   }
   if (st) st->got_first_headers = true;
 
-  std::vector<std::pair<std::string, std::string>> headers;
+  // Arena-backed decode: fields come back as stable string_views, stored in
+  // scratch that persists for the connection (zero heap traffic when warm).
+  // Reset BEFORE decoding — the previous block's views were consumed by the
+  // on_header callbacks that already ran.
+  hdr_arena_.reset();
   const std::string err = dec_.decode(block, lim_.max_header_count,
-                                      lim_.max_header_bytes, headers);
+                                      lim_.max_header_bytes, hdr_out_,
+                                      hdr_arena_);
   if (err == "compression") {
     fail_(kCompressionError);  // HPACK errors are connection errors
     return false;
@@ -491,7 +573,7 @@ inline bool H2Conn::finish_header_block_() {
 
   const bool trailers = !first_block;
   if (!trailers) {
-    for (const auto& [n, v] : headers) ev_.on_header(id, n, v);
+    for (const auto& [n, v] : hdr_out_) ev_.on_header(id, n, v);
   }
   ev_.on_headers_end(id, end_stream, trailers);
   if (end_stream) {
@@ -512,7 +594,8 @@ inline void H2Conn::submit_response(
   Stream* st = find_(id);
   if (!st || st->closed || st->refused) return;  // gone — caller learns via events
 
-  std::string block;
+  std::string& block = enc_block_;
+  block.clear();
   for (const auto& [n, v] : headers) enc_.encode(n, v, block);
 
   // HEADERS (+ CONTINUATION if the block exceeds the peer's max frame size)
@@ -554,10 +637,8 @@ inline void H2Conn::submit_rst(std::uint32_t id, std::uint32_t code) {
 
 inline void H2Conn::submit_goaway(std::uint32_t code) {
   if (fatal_) return;
-  std::string p;
-  frame::append_u32(p, last_client_id_ & 0x7fffffff);
-  frame::append_u32(p, code);
-  frame::append(out_, frame::kGoaway, 0, 0, p);
+  frame::append_u32x2_frame(out_, frame::kGoaway, 0, 0,
+                            last_client_id_ & 0x7fffffff, code);
 }
 
 inline std::size_t H2Conn::queued_bytes(std::uint32_t id) const {
@@ -570,7 +651,7 @@ inline bool H2Conn::stream_exists(std::uint32_t id) const {
 }
 
 inline bool H2Conn::want_write() const {
-  if (!out_.empty()) return true;
+  if (out_.size() > out_pos_) return true;
   if (fatal_) return false;
   for (const auto& [id, st] : streams_) {
     (void)id;
@@ -582,18 +663,19 @@ inline bool H2Conn::want_write() const {
 
 // Serialize DATA (control frames were appended eagerly at submit time),
 // honoring per-stream + connection flow windows. One frame per stream per
-// round → no stream starves its neighbors.
+// round → no stream starves its neighbors. Partially-sent front chunks
+// advance sq_pos instead of erase(0, n) — see consume() for the rationale.
 inline void H2Conn::produce() {
   for (;;) {
     bool progress = false;
-    std::vector<std::uint32_t> finished;
+    finished_.clear();
     for (auto& [id, st] : streams_) {
       if (st.closed || st.refused) continue;
 
       if (st.queued == 0) {
         if (st.finish_after) {  // END_STREAM-only DATA frame
           frame::append(out_, frame::kData, frame::kEndStream, id, {});
-          finished.push_back(id);
+          finished_.push_back(id);
           progress = true;
         } else if (!st.sendq_empty_fired) {
           st.sendq_empty_fired = true;
@@ -603,25 +685,30 @@ inline void H2Conn::produce() {
       }
       if (conn_send_window_ <= 0 || st.send_window <= 0) continue;  // deferred
 
-      // NB: cap by the FRONT chunk's size, not the queue total — `chunk`
-      // below is a view into exactly that one string. (Sending a partial
-      // front chunk is fine: the next round continues where we stopped.)
+      // NB: cap by the FRONT chunk's remaining bytes (from sq_pos), not the
+      // queue total — `chunk` below is a view into exactly that string.
+      // (Sending a partial front chunk is fine: the next round continues at
+      // sq_pos.)
       const std::size_t n = std::min<std::size_t>(
           {std::size_t(peer_max_frame_), std::size_t(st.send_window),
-           std::size_t(conn_send_window_), st.sendq.front().size()});
-      const std::string_view chunk(st.sendq.front().data(), n);
+           std::size_t(conn_send_window_),
+           st.sendq.front().size() - st.sq_pos});
+      const std::string_view chunk(st.sendq.front().data() + st.sq_pos, n);
       const bool end = (n == st.queued) && st.finish_after;
       frame::append(out_, frame::kData, end ? frame::kEndStream : std::uint8_t(0),
                     id, chunk);
-      st.sendq.front().erase(0, n);
-      if (st.sendq.front().empty()) st.sendq.pop_front();
+      st.sq_pos += n;
+      if (st.sq_pos == st.sendq.front().size()) {
+        st.sendq.pop_front();
+        st.sq_pos = 0;
+      }
       st.queued -= n;
       st.send_window -= std::int64_t(n);
       conn_send_window_ -= std::int64_t(n);
       progress = true;
-      if (end) finished.push_back(id);
+      if (end) finished_.push_back(id);
     }
-    for (const std::uint32_t id : finished) close_sent_(id, frame::kNoError);
+    for (const std::uint32_t id : finished_) close_sent_(id, frame::kNoError);
     if (!progress) break;
   }
 }

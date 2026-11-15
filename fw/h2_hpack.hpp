@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "fw/arena.hpp"
 #include "fw/detail/base.hpp"
 #include "fw/h2_hpack_tables.hpp"
 
@@ -160,8 +161,13 @@ inline bool huffman_decode(std::string_view bits, std::string& out) {
 
 // ---------------------------------------------------------------------------
 // String literal (§5.2): H flag + 7-bit length + payload (raw or Huffman).
+// The view flavor decodes into arena-backed storage: plain literals and
+// Huffman-decoded strings are copied into `scratch` (bump allocation, no
+// per-string malloc) and handed back as stable views.
 // ---------------------------------------------------------------------------
-inline bool decode_string(std::string_view& buf, std::string& out) {
+inline bool decode_string(std::string_view& buf, Arena& scratch,
+                          std::string& huff_scratch,
+                          std::string_view& out) {
   if (buf.empty()) return false;
   const bool huff = (std::uint8_t(buf.front()) & 0x80) != 0;
   std::uint64_t len = 0;
@@ -169,8 +175,12 @@ inline bool decode_string(std::string_view& buf, std::string& out) {
   if (len > buf.size()) return false;
   const std::string_view data = buf.substr(0, std::size_t(len));
   buf.remove_prefix(std::size_t(len));
-  if (huff) return huffman_decode(data, out);
-  out.assign(data);
+  if (huff) {
+    if (!huffman_decode(data, huff_scratch)) return false;
+    out = scratch.store(huff_scratch);
+  } else {
+    out = scratch.store(data);
+  }
   return true;
 }
 
@@ -190,15 +200,23 @@ inline void encode_string(std::string& out, std::string_view v) {
 // (RFC 7541 §4.3 → COMPRESSION_ERROR). Header count/size caps are enforced
 // while decoding — the HPACK-bomb defense — so a hostile block can never
 // balloon memory; the caller maps "too_large" to a stream refusal.
+//
+// decode() fills `out` with views that point into `scratch` (the caller's
+// arena): stable until the arena is reset, immune to dynamic-table
+// eviction, and allocation-free after the arena is warm. The caller copies
+// them into its own storage (the engine does, synchronously, in
+// on_header) before resetting the arena.
 // ---------------------------------------------------------------------------
 class Decoder {
  public:
+  using Field = std::pair<std::string_view, std::string_view>;
+
   explicit Decoder(std::uint32_t table_max = 4096) : table_max_(table_max) {}
 
   // Returns "" on success; on failure a short tag: "compression"/"too_large".
   std::string decode(std::string_view buf, std::size_t max_headers,
                      std::size_t max_bytes,
-                     std::vector<std::pair<std::string, std::string>>& out);
+                     std::vector<Field>& out, Arena& scratch);
 
   void set_table_max(std::uint32_t m) { table_max_ = m; }
 
@@ -218,14 +236,16 @@ class Decoder {
   }
 
  private:
-  [[nodiscard]] bool add_dynamic(std::string n, const std::string& v) {
+  // The table owns its entries (std::string copies); eviction frees them
+  // freely — decode() never lets an `out` view point here.
+  [[nodiscard]] bool add_dynamic(std::string_view n, std::string_view v) {
     const std::size_t sz = n.size() + v.size() + 32;
     if (sz > table_max_) {  // §4.4: bigger than the table → empty the table
       dyn_.clear();
       dyn_size_ = 0;
       return true;
     }
-    dyn_.emplace_front(std::move(n), v);
+    dyn_.emplace_front(std::string(n), std::string(v));
     dyn_size_ += sz;
     while (dyn_size_ > table_max_ && !dyn_.empty()) {
       const auto& b = dyn_.back();
@@ -238,6 +258,7 @@ class Decoder {
   std::deque<std::pair<std::string, std::string>> dyn_;
   std::size_t dyn_size_ = 0;  // Σ(name + value + 32)
   std::uint32_t table_max_ = 4096;
+  std::string huff_scratch_;  // reused per literal — no per-string allocation
 };
 
 // ---------------------------------------------------------------------------
@@ -273,7 +294,7 @@ class Encoder {
 // ---------------------------------------------------------------------------
 inline std::string Decoder::decode(
     std::string_view buf, std::size_t max_headers, std::size_t max_bytes,
-    std::vector<std::pair<std::string, std::string>>& out) {
+    std::vector<Field>& out, Arena& scratch) {
   out.clear();
   std::size_t total = 0;
   bool overflow = false;     // caps exceeded: keep decoding (HPACK state must
@@ -296,28 +317,33 @@ inline std::string Decoder::decode(
       if (!decode_uint(buf, 7, idx)) return "compression";
       std::string_view n, v;
       if (!lookup(idx, n, v)) return "compression";
-      if (fits(n.size(), v.size())) out.emplace_back(n, v);
+      // Copy through the arena: a later literal insert in this same block
+      // could evict the table entry these views point at.
+      if (fits(n.size(), v.size()))
+        out.emplace_back(scratch.store(n), scratch.store(v));
       block_started = true;
       continue;
     }
     if ((b & 0xc0) == 0x40) {  // 01xxxxxx — literal, incremental indexing
       std::uint64_t idx = 0;
       if (!decode_uint(buf, 6, idx)) return "compression";
-      std::string n, v;
+      std::string_view n, v;
       if (idx > 0) {
         std::string_view sn, sv;
         if (!lookup(idx, sn, sv)) return "compression";
-        n.assign(sn);
-        if (!decode_string(buf, v)) return "compression";
+        n = scratch.store(sn);  // ditto — eviction-safe
+        if (!decode_string(buf, scratch, huff_scratch_, v))
+          return "compression";
       } else {
-        if (!decode_string(buf, n) || !decode_string(buf, v))
+        if (!decode_string(buf, scratch, huff_scratch_, n) ||
+            !decode_string(buf, scratch, huff_scratch_, v))
           return "compression";
       }
       const bool keep = fits(n.size(), v.size());
       // The insert MUST happen regardless of list overflow, or the peer's
       // dynamic table would drift from ours (→ COMPRESSION_ERROR later).
-      (void)add_dynamic(std::move(n), std::move(v));
-      if (keep) out.emplace_back(dyn_.front().first, dyn_.front().second);
+      (void)add_dynamic(n, v);
+      if (keep) out.emplace_back(n, v);
       block_started = true;
       continue;
     }
@@ -337,17 +363,19 @@ inline std::string Decoder::decode(
     // 0000xxxx / 0001xxxx — literal without indexing / never indexed
     std::uint64_t idx = 0;
     if (!decode_uint(buf, 4, idx)) return "compression";
-    std::string n, v;
+    std::string_view n, v;
     if (idx > 0) {
       std::string_view sn, sv;
       if (!lookup(idx, sn, sv)) return "compression";
-      n.assign(sn);
-      if (!decode_string(buf, v)) return "compression";
+      n = scratch.store(sn);  // ditto — eviction-safe
+      if (!decode_string(buf, scratch, huff_scratch_, v))
+        return "compression";
     } else {
-      if (!decode_string(buf, n) || !decode_string(buf, v))
+      if (!decode_string(buf, scratch, huff_scratch_, n) ||
+          !decode_string(buf, scratch, huff_scratch_, v))
         return "compression";
     }
-    if (fits(n.size(), v.size())) out.emplace_back(std::move(n), std::move(v));
+    if (fits(n.size(), v.size())) out.emplace_back(n, v);
     block_started = true;
   }
   return overflow ? "too_large" : "";

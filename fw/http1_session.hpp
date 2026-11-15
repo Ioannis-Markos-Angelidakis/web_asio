@@ -15,6 +15,10 @@
 #include "fw/app.hpp"
 #include "fw/shutdown.hpp"
 
+// <charconv> for std::to_chars: status/content-length formatting without
+// std::format or std::to_string temporary strings.
+#include <charconv>
+
 namespace fw {
 namespace h1 {
 
@@ -92,24 +96,45 @@ class Http1Session final : public ServerHooks,
     Response& r = ctx.res;
     const bool head = (ctx.req.method == "HEAD");
     const bool ka = keep_alive_ && !close_after_;
-    std::string out;
+    // Per-connection serialization scratch, reused across keep-alive
+    // requests: clear() keeps the capacity, so a warm connection writes a
+    // typical response with zero heap traffic (the old version built a
+    // fresh string plus 2-4 temporaries per header).
+    std::string& out = wbuf_;
+    out.clear();
     out.reserve(256 + r.body.size());
-    out += std::format("HTTP/1.1 {} {}\r\n", r.status, http_status_text(r.status));
+    char nb[24];
+    out += "HTTP/1.1 ";
+    {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), r.status);
+      out.append(nb, std::size_t(p - nb));
+    }
+    out += ' ';
+    out += http_status_text(r.status);
+    out += "\r\n";
     bool explicit_cl = false;
-    std::string cl_value;
+    std::string_view cl_value;
     for (const auto& [k, v] : r.headers) {
-      if (ieq_ascii(k, "content-length")) { explicit_cl = true; cl_value = sanitize_header_value(v); continue; }
+      if (ieq_ascii(k, "content-length")) { explicit_cl = true; cl_value = v; continue; }
       if (ieq_ascii(k, "connection") || ieq_ascii(k, "transfer-encoding") ||
           ieq_ascii(k, "keep-alive") || ieq_ascii(k, "upgrade"))
         continue;
-      out += header_line_(k, v);
+      put_header_(out, k, v);
     }
-    out += "content-type: " + sanitize_header_value(r.content_type) + "\r\n";
-    out += "content-length: " +
-           (explicit_cl ? cl_value : std::to_string(r.body.size())) + "\r\n";
-    out += "connection: " + std::string(ka ? "keep-alive" : "close") + "\r\n";
-    out += "date: " + http_date_now() + "\r\n";
-    out += "server: " + server_id() + "\r\n";
+    put_header_(out, "content-type", r.content_type);
+    out += "content-length: ";
+    if (explicit_cl) {
+      append_sanitized(out, cl_value);
+    } else {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), r.body.size());
+      out.append(nb, std::size_t(p - nb));
+    }
+    out += "\r\n";
+    put_header_(out, "connection", ka ? "keep-alive" : "close");
+    out += "date: ";
+    out += http_date_now();  // per-second thread cache — see util.hpp
+    out += "\r\n";
+    put_header_(out, "server", server_id());
     out += "\r\n";
     if (!head) out += r.body;
     last_status_ = r.status;
@@ -131,14 +156,26 @@ class Http1Session final : public ServerHooks,
                                            app_.limits.max_sse_outbox);
     ctx.out = out;
     cur_out_ = out;
-    std::string head;
+    std::string& head = wbuf_;
+    head.clear();
     head.reserve(512);
-    head += std::format("HTTP/1.1 {} {}\r\n", status, http_status_text(status));
-    head += "content-type: " + sanitize_header_value(content_type) + "\r\n";
-    for (const auto& [k, v] : headers) head += header_line_(k, v);
-    head += "connection: close\r\n";
-    head += "date: " + http_date_now() + "\r\n";
-    head += "server: " + server_id() + "\r\n\r\n";
+    char nb[24];
+    head += "HTTP/1.1 ";
+    {
+      auto [p, ec] = std::to_chars(nb, nb + sizeof(nb), status);
+      head.append(nb, std::size_t(p - nb));
+    }
+    head += ' ';
+    head += http_status_text(status);
+    head += "\r\n";
+    put_header_(head, "content-type", content_type);
+    for (const auto& [k, v] : headers) put_header_(head, k, v);
+    put_header_(head, "connection", "close");
+    head += "date: ";
+    head += http_date_now();
+    head += "\r\n";
+    put_header_(head, "server", server_id());
+    head += "\r\n";
     last_status_ = status;
     response_started_ = true;
     co_await write_all_(head);
@@ -166,6 +203,16 @@ class Http1Session final : public ServerHooks,
 
   static std::string header_line_(const std::string& k, const std::string& v) {
     return to_lower_ascii(k) + ": " + sanitize_header_value(v) + "\r\n";
+  }
+
+  // Append one "name: value\r\n" line straight into the output buffer:
+  // lower-cased name, CR/LF/NUL-stripped value — no temporary strings.
+  static void put_header_(std::string& out, std::string_view k,
+                          std::string_view v) {
+    append_lower_ascii(out, k);
+    out += ": ";
+    append_sanitized(out, v);
+    out += "\r\n";
   }
 
   // ---- low-level I/O ---------------------------------------------------------
@@ -311,12 +358,12 @@ class Http1Session final : public ServerHooks,
           if (to_lower_ascii(value).find("100-continue") != std::string::npos)
             expect_continue = true;
         }
-        req.headers[lname] = std::string(value);  // lower-cased keys
+        req.set_header(std::move(lname), std::string(value));  // lower-cased keys
       }
       if (te_chunked && has_cl)
         throw RequestError{400,
                            "both Content-Length and Transfer-Encoding"};  // smuggling
-      if (req.keep_alive && !req.headers.contains("host"))
+      if (req.keep_alive && req.header("host") == nullptr)
         throw RequestError{400, "missing Host header"};
       req.keep_alive = req.keep_alive ? !conn_close : conn_ka;
 
@@ -440,20 +487,22 @@ class Http1Session final : public ServerHooks,
     HttpCtx ctx;
     ctx.req = std::move(req);
     ctx.hooks = this;
-    auto sig = std::make_shared<asio::cancellation_signal>();
-    cur_cancel_ = sig.get();
-    const std::string log_line = std::format(
-        "h1 {} {} {}", ctx.req.method, ctx.req.path, remote_);
-
     asio::error_code fail_ec;
     bool failed = false;
     int err_status = 0;
     std::string err_msg;
+    // One reusable signal per connection: h1 processes exactly one request
+    // at a time, and the previous co_spawn has fully completed (it is
+    // awaited below), so its slot is disconnected before the next request
+    // re-arms this one. Saves a make_shared round-trip per request.
+    cur_cancel_ = &cancel_sig_;
+    const std::string log_line = std::format(
+        "h1 {} {} {}", ctx.req.method, ctx.req.path, remote_);
     try {
       co_await asio::co_spawn(
           co_await asio::this_coro::executor,
           [&ctx, this]() -> asio::awaitable<void> { co_await app_.dispatch(ctx); },
-          asio::bind_cancellation_slot(sig->slot(), asio::use_awaitable));
+          asio::bind_cancellation_slot(cancel_sig_.slot(), asio::use_awaitable));
       if (!ctx.streaming) {
         if (ctx.res.status < 100 || ctx.res.status > 599) ctx.res.status = 500;
         co_await send_response(ctx);
@@ -573,6 +622,7 @@ class Http1Session final : public ServerHooks,
   App& app_;
   ShutdownRegistry& reg_;
   std::string rbuf_;
+  std::string wbuf_;              // response serialization scratch (reused)
   std::size_t rpos_ = 0;
   bool tls_;
   std::string alpn_;
@@ -582,6 +632,7 @@ class Http1Session final : public ServerHooks,
   bool response_started_ = false;
   int last_status_ = 0;
   std::chrono::steady_clock::time_point req_deadline_{};
+  asio::cancellation_signal cancel_sig_{};  // re-armed per request
   asio::cancellation_signal* cur_cancel_ = nullptr;
   std::shared_ptr<OutStream> cur_out_;
   std::shared_ptr<Latch> drain_done_;
